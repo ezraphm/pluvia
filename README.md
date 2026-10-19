@@ -42,3 +42,8 @@ Verified: list/find/dry-run, quit via osascript, game detection and exit, `open 
 `sysctl kern.memorystatus_vm_pressure_level` readable, JXA frontmost app readable.
 Also verified (on a throwaway `sleep`): SIGSTOP/SIGCONT, `taskpolicy -b/-B` without sudo, `resume-all` after a simulated crash.
 Not verified: RAM actually freed (only `ps` RSS estimates), FPS effect, Automation prompt wording.
+
+## Menu bar app
+`menubar/build.sh` builds `menubar/build/GameON.app` (needs `swiftc`; the app bundles a copy of `gamefocus.py`,
+so rebuild after changing it). It is a thin shell: Start/Stop watching (+ dry-run toggle), Restore now,
+EMERGENCY Resume all, open config/log, Start at login (LaunchAgent). Stop watch CLI instances first: two watchers race.
