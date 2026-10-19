@@ -181,5 +181,28 @@ class Restore(IsolatedHome):
         self.assertEqual(left, ["A", "M"])
 
 
+class Watch(unittest.TestCase):
+    def test_trigger_needs_consecutive_hits_and_resets_on_gap(self):
+        counts = {}
+        self.assertIsNone(gf.watch_tick(counts, {"g"}))          # 1st hit
+        self.assertIsNone(gf.watch_tick(counts, set()))          # gap (alt-tab, flicker) resets
+        self.assertIsNone(gf.watch_tick(counts, {"g"}))
+        self.assertEqual(gf.watch_tick(counts, {"g"}), "g")      # 2 in a row
+
+    def test_only_watch_true_profiles_with_match_are_polled(self):
+        cfg = {"profiles": {
+            "a": {"watch": True, "game": {"match": "steamapps/common/", "match_args": True}},
+            "b": {"game": {"match": "x"}},
+            "c": {"watch": True, "game": {}}}}
+        seen = []
+        with mock.patch.object(gf, "find_game_pids", side_effect=lambda m, a: seen.append((m, a)) or [5]):
+            self.assertEqual(gf.watched_hits(cfg), {"a"})
+        self.assertEqual(seen, [("steamapps/common/", True)])
+
+    def test_validate_rejects_watch_without_match(self):
+        c = {"profiles": {"w": {"watch": True, "game": {}}}}
+        self.assertEqual(len(gf.validate_config(c)), 1)
+
+
 if __name__ == "__main__":
     unittest.main()

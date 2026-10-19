@@ -11,11 +11,17 @@ python3 gamefocus.py find "regex"          # test game-process match (ps comm)
 python3 gamefocus.py run <profile> --dry-run
 python3 gamefocus.py run <profile>         # quit apps, wait for game, restore
 python3 gamefocus.py status | restore      # pending snapshot / crash recovery
+python3 gamefocus.py watch [--dry-run]    # auto-run profiles with "watch": true when their game starts
 python3 -m unittest discover -s tests
 ```
 
 Config: `game.match` is a regex on the executable **path** (`ps comm=`), not the bundle id
 (`find` first). `quit[].restore` = `auto` | `late` | `manual`; a typo is a config error.
+
+## Watch (auto trigger)
+Opt-in per profile: `"watch": true` + `game.match`. Fires after 2 consecutive polls (3s apart) with a match,
+then quits apps, waits for the game to exit, restores. Launcher style: one profile for all Steam games:
+`"game": {"match": "steamapps/common/", "match_args": true}`. No fullscreen/Game Mode detection (not readable).
 
 ## macOS notes
 - First quit of each app triggers an Automation permission prompt for your terminal.

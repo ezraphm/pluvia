@@ -325,6 +325,8 @@ def validate_config(cfg):
                 re.compile(match)
             except (re.error, TypeError) as e:
                 errs.append("%s.game.match is not a valid regex: %s" % (where, e))
+        if prof.get("watch") and not match:
+            errs.append("%s: watch=true needs game.match" % where)
         quit_list = prof.get("quit", [])
         if not isinstance(quit_list, list):
             errs.append("%s.quit must be a list" % where)
@@ -540,20 +542,30 @@ def cmd_run(args):
             print("Cancelled.")
             return
 
+    run_session(cfg, args.profile, prof, targets)
+
+
+def run_session(cfg, name, prof, targets, launch=True):
+    """Quit targets, wait for the game, restore. Returns True if interrupted (Ctrl+C/SIGTERM/SIGHUP)."""
+    st = cfg["settings"]
+    game = prof.get("game", {})
+    interrupted = False
     _install_signals()
     snap = None
     try:
         if targets:
-            save_snapshot(args.profile, targets)  # BEFORE quitting
+            save_snapshot(name, targets)  # BEFORE quitting
             done, stuck = quit_targets(targets, st["quit_timeout"])
-            save_snapshot(args.profile, done)     # only restore what we really quit
-            snap = {"profile": args.profile, "apps": done}
+            save_snapshot(name, done)     # only restore what we really quit
+            snap = {"profile": name, "apps": done}
             if done:
                 time.sleep(2)
         log("%d app(s) closed" % len(snap["apps"]) if snap else "no apps closed")
 
         match, match_args = game.get("match"), game.get("match_args", False)
-        if game.get("launch_cmd"):
+        if not launch:
+            pass
+        elif game.get("launch_cmd"):
             sh(game["launch_cmd"], timeout=20)
         elif game.get("launch"):
             sh(["open", "-a", game["launch"]], timeout=20)
@@ -577,6 +589,7 @@ def cmd_run(args):
         else:
             input("No game.match set. Press Enter when you are done playing... ")
     except KeyboardInterrupt:
+        interrupted = True
         log("interrupted, restoring apps")
     finally:
         snap = load_snapshot()
@@ -586,11 +599,67 @@ def cmd_run(args):
             except KeyboardInterrupt:
                 log("grace wait skipped")
             restore(cfg, snap)
+    return interrupted
+
+
+def watched_hits(cfg):
+    """Names of opt-in (watch=true) profiles whose game.match currently matches a process."""
+    hits = set()
+    for name, prof in cfg["profiles"].items():
+        g = prof.get("game", {})
+        if prof.get("watch") and g.get("match") and find_game_pids(g["match"], g.get("match_args", False)):
+            hits.add(name)
+    return hits
+
+
+def watch_tick(counts, hits, need=2):
+    """Hysteresis: a profile fires only after `need` consecutive polls with a hit; any gap resets it."""
+    for name in list(counts):
+        if name not in hits:
+            del counts[name]
+    for name in sorted(hits):
+        counts[name] = counts.get(name, 0) + 1
+        if counts[name] >= need:
+            return name
+    return None
+
+
+def cmd_watch(args):
+    cfg = load_config()
+    names = [n for n, p in cfg["profiles"].items() if p.get("watch")]
+    if not names:
+        sys.exit('No profile has "watch": true (and a game.match). Add it to a profile first.')
+    _install_signals()
+    log("watching for: %s%s (Ctrl+C to stop)" % (", ".join(names), " [dry-run]" if args.dry_run else ""))
+    counts = {}
+    try:
+        while True:
+            fire = watch_tick(counts, watched_hits(cfg))
+            if fire:
+                counts.clear()
+                log("game detected for profile '%s'" % fire)
+                if args.dry_run:
+                    log("dry-run: would quit apps now. Waiting for the game to exit.")
+                    while fire in watched_hits(cfg):
+                        time.sleep(3)
+                elif load_snapshot():
+                    log("previous snapshot still pending, not touching apps. Run `restore`.")
+                    while fire in watched_hits(cfg):
+                        time.sleep(3)
+                else:
+                    prof = cfg["profiles"][fire]
+                    targets, _ = select_targets(list_apps(), norm_entries(prof.get("quit", [])), cfg["keep"])
+                    if run_session(cfg, fire, prof, targets, launch=False):
+                        break
+            time.sleep(3)
+    except KeyboardInterrupt:
+        pass
+    log("watch stopped")
 
 
 def main():
     p = argparse.ArgumentParser(description="Free RAM while gaming, restore apps gently afterwards.")
-    sub = p.add_subparsers(dest="cmd", required=True)
+    sub =p.add_subparsers(dest="cmd", required=True)
     sub.add_parser("init", help="create default config").set_defaults(fn=cmd_init)
     sub.add_parser("list", help="show running apps with approx RAM").set_defaults(fn=cmd_list)
     f = sub.add_parser("find", help="test a game-process regex")
@@ -604,6 +673,9 @@ def main():
     r.add_argument("--dry-run", action="store_true")
     r.add_argument("--yes", "-y", action="store_true", help="skip confirmation")
     r.set_defaults(fn=cmd_run)
+    w = sub.add_parser("watch", help="auto-run profiles marked watch=true when their game starts")
+    w.add_argument("--dry-run", action="store_true", help="only log detections, change nothing")
+    w.set_defaults(fn=cmd_watch)
     args = p.parse_args()
     args.fn(args)
 
