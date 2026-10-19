@@ -102,7 +102,7 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate {
         if games.isEmpty { sub.addItem(withTitle: "No installed Steam games found", action: nil, keyEquivalent: "") }
         playItem.submenu = sub
         menu.addItem(.separator())
-        let v = add(menu, "Launch via Steam client (for DRM games)", #selector(toggleViaSteam))
+        let v = add(menu, "Always launch via Steam (for DRM games)", #selector(toggleViaSteam))
         v.state = UserDefaults.standard.bool(forKey: "viaSteam") ? .on : .off
         add(menu, watching ? "Stop watching" : "Start watching", #selector(toggleWatch))
         let d = add(menu, "Dry-run (log only, change nothing)", #selector(toggleDry))
@@ -137,15 +137,8 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate {
         guard let g = sender.representedObject as? [String: String], let id = g["appid"],
               id.allSatisfy({ $0.isNumber }) else { return }
         if !isWatching() { toggleWatch() }
-        DispatchQueue.main.asyncAfter(deadline: .now() + 1) {
-            // Direct .app launch skips the Steam client UI; games with Steam DRM may need the URL route.
-            if let app = g["app"], !UserDefaults.standard.bool(forKey: "viaSteam") {
-                NSWorkspace.shared.openApplication(at: URL(fileURLWithPath: app),
-                                                   configuration: NSWorkspace.OpenConfiguration())
-            } else if let url = URL(string: "steam://rungameid/\(id)") {
-                NSWorkspace.shared.open(url)
-            }
-        }
+        // All launch logic (start Steam if needed, then run the game's .app directly) lives in `gamefocus.py play`.
+        spawnDetached(["play", id] + (UserDefaults.standard.bool(forKey: "viaSteam") ? ["--via-steam"] : []))
     }
 
     @objc func toggleViaSteam() {

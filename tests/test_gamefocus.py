@@ -338,6 +338,44 @@ class SteamGames(unittest.TestCase):
         self.assertEqual(gf.steam_games("/nonexistent/steam"), [])
 
 
+STEAM_APP = {"name": "Steam", "bundle": "com.valvesoftware.steam", "pid": 7}
+GAME = {"appid": "9", "name": "G", "app": "/x/G.app"}
+
+
+class Play(IsolatedHome):
+    def play(self, running_seq, game=GAME, via_steam=False):
+        calls = []
+        seq = iter(running_seq)
+        with mock.patch.object(gf, "steam_games", return_value=[game]), \
+             mock.patch.object(gf, "list_apps", side_effect=lambda: next(seq)), \
+             mock.patch.object(gf, "sh", side_effect=lambda c, timeout=30: calls.append(c) or (0, "", "")), \
+             mock.patch.object(gf.time, "sleep", side_effect=lambda s: calls.append(["sleep", s])):
+            ok = gf.play_game(game["appid"], via_steam, dict(ST))
+        return ok, calls
+
+    def test_steam_running_launches_app_directly_no_steam_open(self):
+        ok, calls = self.play([[STEAM_APP]])
+        self.assertTrue(ok)
+        self.assertEqual(calls, [["open", "-a", "/x/G.app"]])
+
+    def test_steam_not_running_opens_steam_in_background_waits_then_direct(self):
+        ok, calls = self.play([[], [], [STEAM_APP]])
+        self.assertEqual(calls[0], ["open", "-g", "-b", "com.valvesoftware.steam"])
+        self.assertEqual(calls[-1], ["open", "-a", "/x/G.app"])
+        self.assertIn(["sleep", ST["steam_settle"]], calls)
+        self.assertNotIn(["open", "steam://rungameid/9"], calls)
+
+    def test_via_steam_or_no_app_uses_url(self):
+        _, calls = self.play([[STEAM_APP]], via_steam=True)
+        self.assertEqual(calls, [["open", "steam://rungameid/9"]])
+        _, calls = self.play([[STEAM_APP]], game={"appid": "9", "name": "G"})
+        self.assertEqual(calls, [["open", "steam://rungameid/9"]])
+
+    def test_unknown_game_is_false(self):
+        with mock.patch.object(gf, "steam_games", return_value=[]):
+            self.assertFalse(gf.play_game("1", False, dict(ST)))
+
+
 class Watch(unittest.TestCase):
     def test_trigger_needs_consecutive_hits_and_resets_on_gap(self):
         counts = {}

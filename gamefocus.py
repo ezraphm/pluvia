@@ -58,6 +58,8 @@ DEFAULT_SETTINGS = {
     "restore_late_min_delay": 15,   # min seconds after launching "late" (heavy) apps
     "restore_max_wait": 90,         # max seconds to wait for the Mac to calm down per app
     "restore_cpu_idle_pct": 60,     # CPU must be at least this idle before next launch
+    "steam_start_timeout": 30,      # seconds to wait for the Steam client to appear when `play` has to start it
+    "steam_settle": 5,              # seconds to let Steam finish starting before launching the game
     "restore_min_free_pct": 20,     # `memory_pressure` free % must be at least this (8GB Macs idle at pressure level 2)
 }
 
@@ -663,6 +665,49 @@ def steam_games(root=STEAM_ROOT):
     return sorted(games, key=lambda g: g["name"].lower())
 
 
+STEAM_BUNDLE = "com.valvesoftware.steam"
+
+
+def steam_running():
+    return any((a.get("bundle") or "").lower() == STEAM_BUNDLE for a in list_apps())
+
+
+def ensure_steam(st):
+    """Start the Steam client in the background if needed (games with Steamworks want it running)."""
+    if steam_running():
+        return True
+    log("Steam is not running, starting it in the background...")
+    sh(["open", "-g", "-b", STEAM_BUNDLE], timeout=20)
+    deadline = time.time() + st["steam_start_timeout"]
+    while time.time() < deadline:
+        if steam_running():
+            time.sleep(st["steam_settle"])
+            return True
+        time.sleep(1)
+    log("Steam did not appear within %ss, launching the game anyway" % st["steam_start_timeout"])
+    return False
+
+
+def play_game(appid, via_steam, st):
+    """Launch an installed Steam game: its .app directly (Steam started first if needed), else steam:// URL."""
+    game = next((g for g in steam_games() if g["appid"] == str(appid)), None)
+    if not game:
+        return False
+    ensure_steam(st)
+    if game.get("app") and not via_steam:
+        log("launching %s directly" % game["name"])
+        sh(["open", "-a", game["app"]], timeout=20)
+    else:
+        log("launching %s via Steam" % game["name"])
+        sh(["open", "steam://rungameid/%s" % game["appid"]], timeout=20)
+    return True
+
+
+def cmd_play(args):
+    if not play_game(args.appid, args.via_steam, load_config()["settings"]):
+        sys.exit("No installed Steam game with appid %s (see `gamefocus.py games`)." % args.appid)
+
+
 def cmd_games(args):
     games = steam_games()
     if args.json:
@@ -881,6 +926,10 @@ def main():
     g = sub.add_parser("games", help="list installed Steam games")
     g.add_argument("--json", action="store_true")
     g.set_defaults(fn=cmd_games)
+    pl = sub.add_parser("play", help="launch an installed Steam game (starts Steam first if needed)")
+    pl.add_argument("appid")
+    pl.add_argument("--via-steam", action="store_true", help="use steam://rungameid instead of the game's .app")
+    pl.set_defaults(fn=cmd_play)
     sub.add_parser("resume-all", help="EMERGENCY: undo every pause/demote now").set_defaults(fn=cmd_resume_all)
     sub.add_parser("restore", help="restore apps from last snapshot").set_defaults(fn=cmd_restore)
     r = sub.add_parser("run", help="quit apps, wait for game, restore")
