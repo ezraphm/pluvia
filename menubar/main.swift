@@ -38,6 +38,20 @@ func spawnDetached(_ args: [String]) {
     try? p.run()
 }
 
+func steamGames() -> [(id: String, name: String)] {
+    let p = Process()
+    p.executableURL = URL(fileURLWithPath: python)
+    p.arguments = [scriptPath, "games", "--json"]
+    let pipe = Pipe()
+    p.standardOutput = pipe
+    p.standardError = FileHandle.nullDevice
+    guard (try? p.run()) != nil else { return [] }
+    let data = pipe.fileHandleForReading.readDataToEndOfFile()
+    p.waitUntilExit()
+    let arr = (try? JSONSerialization.jsonObject(with: data)) as? [[String: String]] ?? []
+    return arr.compactMap { g in g["appid"].flatMap { id in g["name"].map { (id, $0) } } }
+}
+
 func isWatching() -> Bool { run("/usr/bin/pgrep", ["-f", watchPattern]).0 == 0 }
 func stopWatching() { run("/usr/bin/pkill", ["-TERM", "-f", watchPattern]) }
 
@@ -78,6 +92,17 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate {
         menu.addItem(withTitle: watching ? "Watching\(dry ? " (dry-run)" : "")" : "Not watching", action: nil, keyEquivalent: "")
         menu.addItem(withTitle: snapshotSummary() ?? "No active session", action: nil, keyEquivalent: "")
         menu.addItem(.separator())
+        let playItem = menu.addItem(withTitle: "Play Steam game", action: nil, keyEquivalent: "")
+        let sub = NSMenu()
+        let games = steamGames()
+        for g in games {
+            let gi = sub.addItem(withTitle: g.name, action: #selector(play(_:)), keyEquivalent: "")
+            gi.target = self
+            gi.representedObject = g.id
+        }
+        if games.isEmpty { sub.addItem(withTitle: "No installed Steam games found", action: nil, keyEquivalent: "") }
+        playItem.submenu = sub
+        menu.addItem(.separator())
         add(menu, watching ? "Stop watching" : "Start watching", #selector(toggleWatch))
         let d = add(menu, "Dry-run (log only, change nothing)", #selector(toggleDry))
         d.state = dry ? .on : .off
@@ -104,6 +129,15 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate {
         if isWatching() { stopWatching() }
         else { spawnDetached(["watch"] + (UserDefaults.standard.bool(forKey: "dryRun") ? ["--dry-run"] : [])) }
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) { self.refreshIcon() }
+    }
+
+    // Playing from here starts `watch` first (if off), so the profile frees RAM when the game process appears.
+    @objc func play(_ sender: NSMenuItem) {
+        guard let id = sender.representedObject as? String, id.allSatisfy({ $0.isNumber }) else { return }
+        if !isWatching() { toggleWatch() }
+        DispatchQueue.main.asyncAfter(deadline: .now() + 1) {
+            if let url = URL(string: "steam://rungameid/\(id)") { NSWorkspace.shared.open(url) }
+        }
     }
 
     @objc func toggleDry() {

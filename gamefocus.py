@@ -605,6 +605,53 @@ def cmd_find(args):
     print("matches: %s" % (pids or "none"))
 
 
+STEAM_ROOT = os.path.expanduser("~/Library/Application Support/Steam")
+STEAM_NOT_GAMES = {"228980"}  # Steamworks Common Redistributables
+
+
+def steam_games(root=STEAM_ROOT):
+    """Fully installed Steam games across all library folders: [{appid, name}] sorted by name."""
+    libs = [root]
+    try:
+        with open(os.path.join(root, "steamapps", "libraryfolders.vdf"), encoding="utf-8") as f:
+            libs += re.findall(r'"path"\s+"([^"]+)"', f.read())
+    except OSError:
+        pass
+    games, seen = [], set()
+    for lib in dict.fromkeys(libs):
+        apps_dir = os.path.join(lib, "steamapps")
+        try:
+            names = os.listdir(apps_dir)
+        except OSError:
+            continue
+        for fn in names:
+            if not (fn.startswith("appmanifest_") and fn.endswith(".acf")):
+                continue
+            try:
+                with open(os.path.join(apps_dir, fn), encoding="utf-8", errors="replace") as f:
+                    txt = f.read()
+            except OSError:
+                continue
+            kv = dict(re.findall(r'"(appid|name|StateFlags)"\s+"([^"]*)"', txt))
+            appid = kv.get("appid", "")
+            if appid.isdigit() and appid not in seen and appid not in STEAM_NOT_GAMES \
+                    and kv.get("StateFlags", "").isdigit() and int(kv["StateFlags"]) & 4 and kv.get("name"):
+                seen.add(appid)
+                games.append({"appid": appid, "name": kv["name"]})
+    return sorted(games, key=lambda g: g["name"].lower())
+
+
+def cmd_games(args):
+    games = steam_games()
+    if args.json:
+        print(json.dumps(games))
+    else:
+        for g in games:
+            print("%10s  %s" % (g["appid"], g["name"]))
+        if not games:
+            print("No installed Steam games found.")
+
+
 def cmd_resume_all(args):
     n = resume_frozen()
     print("Resumed %d paused/demoted app(s)." % n)
@@ -806,6 +853,9 @@ def main():
     f.add_argument("--args", action="store_true", help="match against full command line")
     f.set_defaults(fn=cmd_find)
     sub.add_parser("status", help="show pending snapshot").set_defaults(fn=cmd_status)
+    g = sub.add_parser("games", help="list installed Steam games")
+    g.add_argument("--json", action="store_true")
+    g.set_defaults(fn=cmd_games)
     sub.add_parser("resume-all", help="EMERGENCY: undo every pause/demote now").set_defaults(fn=cmd_resume_all)
     sub.add_parser("restore", help="restore apps from last snapshot").set_defaults(fn=cmd_restore)
     r = sub.add_parser("run", help="quit apps, wait for game, restore")

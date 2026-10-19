@@ -12,6 +12,7 @@ python3 gamefocus.py run <profile> --dry-run
 python3 gamefocus.py run <profile>         # quit apps, wait for game, restore
 python3 gamefocus.py resume-all            # EMERGENCY: undo every pause/demote (SIGCONT, taskpolicy -B)
 python3 gamefocus.py status | restore      # pending snapshot / crash recovery
+python3 gamefocus.py games [--json]         # installed Steam games (appmanifest_*.acf)
 python3 gamefocus.py watch [--dry-run]    # auto-run profiles with "watch": true when their game starts
 python3 -m unittest discover -s tests
 ```
@@ -46,4 +47,4 @@ Not verified: RAM actually freed (only `ps` RSS estimates), FPS effect, Automati
 ## Menu bar app
 `menubar/build.sh` builds `menubar/build/GameON.app` (needs `swiftc`; the app bundles a copy of `gamefocus.py`,
 so rebuild after changing it). It is a thin shell: Start/Stop watching (+ dry-run toggle), Restore now,
-EMERGENCY Resume all, open config/log, Start at login (LaunchAgent). Stop watch CLI instances first: two watchers race.
+Play Steam game (lists installed games via `gamefocus.py games`, starts `watch` if off, then opens `steam://rungameid/<id>`), EMERGENCY Resume all, open config/log, Start at login (LaunchAgent). Stop watch CLI instances first: two watchers race.

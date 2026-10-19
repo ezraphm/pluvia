@@ -271,6 +271,38 @@ class Actions(IsolatedHome):
         self.assertEqual(order, ["undo A", "open B"])
 
 
+ACF = '''"AppState"
+{
+\t"appid"\t\t"%s"
+\t"name"\t\t"%s"
+\t"StateFlags"\t\t"%s"
+\t"installdir"\t\t"x"
+}
+'''
+
+
+class SteamGames(unittest.TestCase):
+    def make(self, root, games):
+        os.makedirs(os.path.join(root, "steamapps"))
+        for appid, name, flags in games:
+            with open(os.path.join(root, "steamapps", "appmanifest_%s.acf" % appid), "w") as f:
+                f.write(ACF % (appid, name, flags))
+
+    def test_lists_installed_games_across_libraries_skips_tools_and_partial(self):
+        with tempfile.TemporaryDirectory() as a, tempfile.TemporaryDirectory() as b:
+            self.make(a, [("108600", "Project Zomboid", "4"), ("228980", "Steamworks Common Redistributables", "4"),
+                          ("5", "Half Downloaded", "1026")])
+            self.make(b, [("909080", "Cube Escape: Paradox", "4")])
+            with open(os.path.join(a, "steamapps", "libraryfolders.vdf"), "w") as f:
+                f.write('"libraryfolders"\n{\n\t"0"\n\t{\n\t\t"path"\t\t"%s"\n\t}\n\t"1"\n\t{\n\t\t"path"\t\t"%s"\n\t}\n}\n' % (a, b))
+            games = gf.steam_games(a)
+        self.assertEqual([(g["appid"], g["name"]) for g in games],
+                         [("909080", "Cube Escape: Paradox"), ("108600", "Project Zomboid")])
+
+    def test_missing_steam_is_empty_not_error(self):
+        self.assertEqual(gf.steam_games("/nonexistent/steam"), [])
+
+
 class Watch(unittest.TestCase):
     def test_trigger_needs_consecutive_hits_and_resets_on_gap(self):
         counts = {}
