@@ -461,27 +461,85 @@ class Watch(unittest.TestCase):
         self.assertIsNone(gf.watch_tick(counts, {"g"}))
         self.assertEqual(gf.watch_tick(counts, {"g"}), "g")      # 2 in a row
 
-    def test_only_watch_true_profiles_with_match_are_polled(self):
-        cfg = {"profiles": {
-            "a": {"watch": True, "game": {"match": "steamapps/common/", "match_args": True}},
-            "b": {"game": {"match": "x"}},
-            "c": {"watch": True, "game": {}}}}
-        seen = []
-        with mock.patch.object(gf, "find_game_pids", side_effect=lambda m, a: seen.append((m, a)) or [5]):
-            self.assertEqual(gf.watched_hits(cfg), {"a"})
-        self.assertEqual(seen, [("steamapps/common/", True)])
+    def test_validate_rejects_watch_without_match(self):
+        c = {"profiles": {"w": {"watch": True, "game": {}}}}
+        self.assertEqual(len(gf.validate_config(c)), 1)
+
+    def test_hits_use_one_ps_call_per_field_and_ignore_self(self):
+        profiles = {"a": {"game": {"match": "steamapps/common/", "match_args": True}},
+                    "b": {"game": {"match": "nothing-here", "match_args": True}},
+                    "c": {"game": {"match": "cube"}}}
+        out = {"pid=,command=": "10 /S/steamapps/common/G/G\n99 /x steamapps/common/self\n",
+               "pid=,comm=": "11 /Apps/CubeThing\n"}
+        calls = []
+        def fake(cmd, timeout=30):
+            calls.append(cmd[-1])
+            return 0, out[cmd[-1]], ""
+        with mock.patch.object(gf, "sh", side_effect=fake), mock.patch.object(gf.os, "getpid", return_value=99), \
+             mock.patch.object(gf.os, "getppid", return_value=1):
+            self.assertEqual(gf.watched_hits(profiles), {"a", "c"})
+        self.assertEqual(sorted(calls), ["pid=,comm=", "pid=,command="])
 
     def test_wait_gone_ignores_single_flicker(self):
         seq = iter([{"g"}, set(), {"g"}, set(), set()])  # one-poll gap must not count as exit
         calls = []
-        with mock.patch.object(gf, "watched_hits", side_effect=lambda c: calls.append(1) or next(seq)), \
+        with mock.patch.object(gf, "watched_hits", side_effect=lambda p: calls.append(1) or next(seq)), \
              mock.patch.object(gf.time, "sleep"):
             gf.wait_gone({}, "g")
         self.assertEqual(len(calls), 5)
 
-    def test_validate_rejects_watch_without_match(self):
-        c = {"profiles": {"w": {"watch": True, "game": {}}}}
-        self.assertEqual(len(gf.validate_config(c)), 1)
+
+LIB = [{"id": "steam:1", "source": "Steam", "name": "One", "path": "/S/steamapps/common/One"},
+       {"id": "epic:a", "source": "Epic Games", "name": "Alpha", "path": "/E/Alpha"},
+       {"id": "gog:9", "source": "GOG", "name": "Nine"},                       # no path: cannot be matched
+       {"id": "mas:x", "source": "App Store", "name": "X", "path": "/Applications/X.app"}]
+
+
+class LibraryWatch(unittest.TestCase):
+    def cfg(self, **lw):
+        base = {"enabled": True, "profile": "lib", "sources": ["Steam", "Epic Games", "GOG", "App Store"], "exclude": []}
+        base.update(lw)
+        return {"keep": [], "settings": dict(ST), "library_watch": base, "profiles": {
+            "lib": {"quit": [{"app": "Slack", "action": "pause"}]},
+            "explicit": {"watch": True, "game": {"match": "x"}, "quit": []}}}
+
+    def test_disabled_or_missing_profile_adds_nothing(self):
+        self.assertEqual(list(gf.watch_profiles(self.cfg(enabled=False), LIB)), ["explicit"])
+        self.assertEqual(list(gf.watch_profiles(self.cfg(profile="nope"), LIB)), ["explicit"])
+
+    def test_every_matchable_library_game_gets_a_synthetic_profile_sharing_the_quit_list(self):
+        p = gf.watch_profiles(self.cfg(), LIB)
+        self.assertEqual(sorted(p), ["explicit", "lib:epic:a", "lib:mas:x", "lib:steam:1"])
+        g = p["lib:steam:1"]
+        self.assertEqual(g["game"], {"match": r"/S/steamapps/common/One", "match_args": True})
+        self.assertEqual(g["quit"], [{"app": "Slack", "action": "pause"}])
+
+    def test_sources_and_exclude_filter(self):
+        p = gf.watch_profiles(self.cfg(sources=["Steam", "GOG"], exclude=["steam:1"]), LIB)
+        self.assertEqual(list(p), ["explicit"])
+
+    def test_path_with_regex_chars_is_escaped(self):
+        lib = [{"id": "steam:2", "source": "Steam", "name": "T", "path": "/S/Game (2)+/x.app"}]
+        p = gf.watch_profiles(self.cfg(), lib)["lib:steam:2"]
+        self.assertTrue(gf.re.search(p["game"]["match"], "/S/Game (2)+/x.app/Contents/MacOS/x"))
+
+    def test_validate_library_watch(self):
+        c = {"profiles": {"lib": {"quit": []}}, "library_watch": {"enabled": True, "profile": "lib"}}
+        self.assertEqual(gf.validate_config(c), [])
+        c["library_watch"] = {"enabled": "yes", "profile": "nope", "sources": ["Epik"], "exclude": "x"}
+        self.assertEqual(len(gf.validate_config(c)), 4)
+
+    def test_library_games_carry_install_path(self):
+        steam = [{"appid": "1", "name": "One", "app": "/S/steamapps/common/One/One.app", "path": "/S/steamapps/common/One"}]
+        with mock.patch.object(gf, "steam_games", return_value=steam), \
+             mock.patch.object(gf, "epic_games", return_value=[]), mock.patch.object(gf, "gog_games", return_value=[]), \
+             mock.patch.object(gf, "appstore_games", return_value=[]):
+            self.assertEqual(gf.library_games()[0]["path"], "/S/steamapps/common/One")
+
+    def test_list_json_shape(self):
+        apps = [{"name": "A", "bundle": "a.b", "pid": 5}]
+        with mock.patch.object(gf, "list_apps", return_value=apps), mock.patch.object(gf, "ram_by_pid", return_value={5: 12.4}):
+            self.assertEqual(gf.running_apps_json(), [{"name": "A", "bundle": "a.b", "ram_mb": 12}])
 
 
 if __name__ == "__main__":

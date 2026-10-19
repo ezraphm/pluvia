@@ -68,6 +68,7 @@ DEFAULT_SETTINGS = {
 
 RESTORE_MODES = ("auto", "late", "manual")
 ACTIONS = ("keep", "demote", "pause", "quit")
+LIBRARY_SOURCES = ("Steam", "Epic Games", "GOG", "App Store")
 
 # Apps that must keep running at full speed while gaming: voice chat, meetings, music, downloads,
 # and the game launcher. pause/demote on these is refused (an explicit `quit` is still the user's call).
@@ -410,6 +411,21 @@ def validate_config(cfg):
             elif e.get("restore", "auto") not in RESTORE_MODES:
                 errs.append("%s.quit[%d] (%s): restore=%r, must be one of %s"
                             % (where, i, e["app"], e["restore"], "/".join(RESTORE_MODES)))
+    lw = cfg.get("library_watch")
+    if lw is not None:
+        if not isinstance(lw, dict):
+            errs.append("library_watch must be an object")
+        else:
+            if not isinstance(lw.get("enabled", False), bool):
+                errs.append("library_watch.enabled must be true or false")
+            if lw.get("profile") not in profiles:
+                errs.append("library_watch.profile %r is not a profile (available: %s)"
+                            % (lw.get("profile"), ", ".join(profiles) or "none"))
+            bad = [x for x in lw.get("sources", []) if x not in LIBRARY_SOURCES] if isinstance(lw.get("sources", []), list) else None
+            if bad is None or bad:
+                errs.append("library_watch.sources must be a list of: %s" % ", ".join(LIBRARY_SOURCES))
+            if not isinstance(lw.get("exclude", []), list):
+                errs.append("library_watch.exclude must be a list of game ids")
     return errs
 
 
@@ -609,7 +625,16 @@ def cmd_init(args):
     print("Created %s\nEdit it, then try:  python3 gamefocus.py run example --dry-run" % CONFIG)
 
 
+def running_apps_json():
+    ram = ram_by_pid()
+    return [{"name": a["name"], "bundle": a.get("bundle"), "ram_mb": round(ram.get(a["pid"], 0))}
+            for a in list_apps()]
+
+
 def cmd_list(args):
+    if args.json:
+        print(json.dumps(running_apps_json()))
+        return
     apps = list_apps()
     ram = ram_by_pid()
     rows = sorted(((ram.get(a["pid"], 0), a) for a in apps), key=lambda r: -r[0])
@@ -658,6 +683,8 @@ def steam_games(root=STEAM_ROOT):
                 seen.add(appid)
                 g = {"appid": appid, "name": kv["name"]}
                 install = os.path.join(apps_dir, "common", kv.get("installdir", ""))
+                if kv.get("installdir"):
+                    g["path"] = install
                 try:  # direct launch only when the choice is unambiguous
                     bundles = [d for d in os.listdir(install) if d.endswith(".app")]
                 except OSError:
@@ -716,6 +743,7 @@ def epic_games(manifests=EPIC_MANIFESTS):
         m = _json_file(os.path.join(manifests, n))
         if isinstance(m, dict) and m.get("DisplayName") and m.get("AppName") and m.get("InstallLocation"):
             games.append({"id": "epic:" + m["AppName"], "source": "Epic Games", "name": m["DisplayName"],
+                          "path": m["InstallLocation"],
                           "uri": "com.epicgames.launcher://apps/%s?action=launch&silent=true"
                                  % urllib.parse.quote(m["AppName"], safe="")})
     return games
@@ -736,7 +764,7 @@ def gog_games(dirs=GOG_DIRS):
                 if not isinstance(m, dict) or not m.get("gameId") or not m.get("name") or m["gameId"] in seen:
                     continue
                 seen.add(m["gameId"])
-                g = {"id": "gog:" + str(m["gameId"]), "source": "GOG", "name": m["name"]}
+                g = {"id": "gog:" + str(m["gameId"]), "source": "GOG", "name": m["name"], "path": full}
                 if e.endswith(".app"):
                     g["app"] = full
                 games.append(g)
@@ -764,7 +792,7 @@ def appstore_games(dirs=APPSTORE_DIRS):
                 continue
             games.append({"id": "mas:" + str(info.get("CFBundleIdentifier", n)), "source": "App Store",
                           "name": info.get("CFBundleDisplayName") or info.get("CFBundleName") or n[:-4],
-                          "app": os.path.join(d, n)})
+                          "app": os.path.join(d, n), "path": os.path.join(d, n)})
     return games
 
 
@@ -773,8 +801,9 @@ def library_games():
     games = []
     for g in steam_games():
         item = {"id": "steam:" + g["appid"], "source": "Steam", "name": g["name"]}
-        if g.get("app"):
-            item["app"] = g["app"]
+        for k in ("app", "path"):
+            if g.get(k):
+                item[k] = g[k]
         icon = os.path.join(STEAM_ROOT, "appcache", "librarycache", g["appid"], "library_600x900.jpg")
         if os.path.isfile(icon):  # local cache only, nothing is downloaded
             item["icon"] = icon
@@ -955,12 +984,44 @@ def run_session(cfg, name, prof, targets, launch=True):
     return interrupted
 
 
-def watched_hits(cfg):
-    """Names of opt-in (watch=true) profiles whose game.match currently matches a process."""
-    hits = set()
-    for name, prof in cfg["profiles"].items():
+def watch_profiles(cfg, games):
+    """{name: profile} to poll: explicit watch=true profiles, plus (if enabled) one synthetic profile per
+    library game, matched by install path and sharing the chosen profile's quit list."""
+    out = {n: p for n, p in cfg["profiles"].items() if p.get("watch") and p.get("game", {}).get("match")}
+    lw = cfg.get("library_watch") or {}
+    base = cfg["profiles"].get(lw.get("profile"))
+    if lw.get("enabled") and base is not None:
+        sources = lw.get("sources", list(LIBRARY_SOURCES))
+        for g in games:
+            if g.get("path") and g["source"] in sources and g["id"] not in lw.get("exclude", []):
+                out["lib:" + g["id"]] = {"title": g["name"], "quit": base.get("quit", []),
+                                         "game": {"match": re.escape(g["path"]), "match_args": True}}
+    return out
+
+
+def _ps_lines(field):
+    rc, out, _ = sh(["ps", "-axo", "pid=," + field])
+    me = {os.getpid(), os.getppid()}
+    lines = []
+    for line in out.splitlines():
+        parts = line.strip().split(None, 1)
+        if len(parts) == 2 and parts[0].isdigit() and int(parts[0]) not in me:
+            lines.append(parts[1])
+    return lines
+
+
+def watched_hits(profiles):
+    """Names of profiles whose game.match currently matches a process (one `ps` call per field)."""
+    cache, hits = {}, set()
+    for name, prof in profiles.items():
         g = prof.get("game", {})
-        if prof.get("watch") and g.get("match") and find_game_pids(g["match"], g.get("match_args", False)):
+        if not g.get("match"):
+            continue
+        field = "command=" if g.get("match_args") else "comm="
+        if field not in cache:
+            cache[field] = _ps_lines(field)
+        rx = re.compile(g["match"], re.I)
+        if any(rx.search(line) for line in cache[field]):
             hits.add(name)
     return hits
 
@@ -977,40 +1038,56 @@ def watch_tick(counts, hits, need=2):
     return None
 
 
-def wait_gone(cfg, name):
+def wait_gone(profiles, name):
     """Block until the profile's game is absent for 2 consecutive polls (launchers can flicker)."""
     gone = 0
     while gone < 2:
         time.sleep(3)
-        gone = gone + 1 if name not in watched_hits(cfg) else 0
+        gone = gone + 1 if name not in watched_hits(profiles) else 0
+
+
+def config_mtime():
+    try:
+        return os.path.getmtime(CONFIG)
+    except OSError:
+        return None
 
 
 def cmd_watch(args):
     cfg = load_config()
-    names = [n for n, p in cfg["profiles"].items() if p.get("watch")]
-    if not names:
-        sys.exit('No profile has "watch": true (and a game.match). Add it to a profile first.')
     _install_signals()
     if not args.dry_run:
         n = resume_frozen()
         if n:
             log("watchdog: resumed %d frozen app(s) from an earlier session" % n)
-    log("watching for: %s%s (Ctrl+C to stop)" % (", ".join(names), " [dry-run]" if args.dry_run else ""))
+    games, games_at, cfg_at = library_games(), time.time(), config_mtime()
+    profiles = watch_profiles(cfg, games)
+    log("watching %d profile(s)%s (Ctrl+C to stop)" % (len(profiles), " [dry-run]" if args.dry_run else ""))
+    if not profiles:
+        log("nothing to watch yet: enable library auto-detect in the menu bar app, or set watch=true on a profile")
     counts = {}
     try:
         while True:
-            fire = watch_tick(counts, watched_hits(cfg))
+            if config_mtime() != cfg_at or time.time() - games_at > 60:  # UI edits apply without restart
+                try:
+                    cfg = load_config() if config_mtime() != cfg_at else cfg
+                except SystemExit as e:
+                    log("config reload failed, keeping the previous one: %s" % e)
+                cfg_at = config_mtime()
+                games, games_at = library_games(), time.time()
+                profiles = watch_profiles(cfg, games)
+            fire = watch_tick(counts, watched_hits(profiles))
             if fire:
                 counts.clear()
-                log("game detected for profile '%s'" % fire)
+                prof = profiles[fire]
+                log("game detected: %s (profile '%s')" % (prof.get("title", fire), fire))
                 if args.dry_run:
                     log("dry-run: would quit apps now. Waiting for the game to exit.")
-                    wait_gone(cfg, fire)
+                    wait_gone(profiles, fire)
                 elif load_snapshot():
                     log("previous snapshot still pending, not touching apps. Run `restore`.")
-                    wait_gone(cfg, fire)
+                    wait_gone(profiles, fire)
                 else:
-                    prof = cfg["profiles"][fire]
                     targets, _ = select_targets(list_apps(), norm_entries(prof.get("quit", [])), cfg["keep"])
                     if run_session(cfg, fire, prof, targets, launch=False):
                         break
@@ -1024,7 +1101,9 @@ def main():
     p = argparse.ArgumentParser(description="Free RAM while gaming, restore apps gently afterwards.")
     sub =p.add_subparsers(dest="cmd", required=True)
     sub.add_parser("init", help="create default config").set_defaults(fn=cmd_init)
-    sub.add_parser("list", help="show running apps with approx RAM").set_defaults(fn=cmd_list)
+    ls = sub.add_parser("list", help="show running apps with approx RAM")
+    ls.add_argument("--json", action="store_true")
+    ls.set_defaults(fn=cmd_list)
     f = sub.add_parser("find", help="test a game-process regex")
     f.add_argument("regex")
     f.add_argument("--args", action="store_true", help="match against full command line")
