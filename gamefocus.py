@@ -22,13 +22,16 @@ Safety rules built in
   * A snapshot is written BEFORE quitting, so `restore` works even after a crash.
 """
 import argparse
+import glob
 import json
 import os
+import plistlib
 import re
 import signal
 import subprocess
 import sys
 import time
+import urllib.parse
 from datetime import datetime
 
 HOME_DIR = os.path.expanduser("~/.gamefocus")
@@ -688,35 +691,139 @@ def ensure_steam(st):
     return False
 
 
-def play_game(appid, via_steam, st):
-    """Launch an installed Steam game: its .app directly (Steam started first if needed), else steam:// URL."""
-    game = next((g for g in steam_games() if g["appid"] == str(appid)), None)
+EPIC_MANIFESTS = os.path.expanduser("~/Library/Application Support/Epic/EpicGamesLauncher/Data/Manifests")
+GOG_DIRS = ["/Applications", os.path.expanduser("~/Applications"), os.path.expanduser("~/GOG Games"),
+            "/Users/Shared/GOG"]
+APPSTORE_DIRS = ["/Applications"]
+
+
+def _json_file(path):
+    try:
+        with open(path, encoding="utf-8") as f:
+            return json.load(f)
+    except (OSError, ValueError):
+        return None
+
+
+# Importer logic ported from the MIT-licensed Aether project (Epic/GOG/App Store importers), Python rewrite.
+def epic_games(manifests=EPIC_MANIFESTS):
+    games = []
+    try:
+        names = sorted(n for n in os.listdir(manifests) if n.endswith(".item"))
+    except OSError:
+        return games
+    for n in names:
+        m = _json_file(os.path.join(manifests, n))
+        if isinstance(m, dict) and m.get("DisplayName") and m.get("AppName") and m.get("InstallLocation"):
+            games.append({"id": "epic:" + m["AppName"], "source": "Epic Games", "name": m["DisplayName"],
+                          "uri": "com.epicgames.launcher://apps/%s?action=launch&silent=true"
+                                 % urllib.parse.quote(m["AppName"], safe="")})
+    return games
+
+
+def gog_games(dirs=GOG_DIRS):
+    games, seen = [], set()
+    for d in dirs:
+        try:
+            entries = sorted(os.listdir(d))
+        except OSError:
+            continue
+        for e in entries:
+            full = os.path.join(d, e)
+            where = os.path.join(full, "Contents", "Resources") if e.endswith(".app") else full
+            for info in sorted(glob.glob(os.path.join(glob.escape(where), "goggame-*.info"))):
+                m = _json_file(info)
+                if not isinstance(m, dict) or not m.get("gameId") or not m.get("name") or m["gameId"] in seen:
+                    continue
+                seen.add(m["gameId"])
+                g = {"id": "gog:" + str(m["gameId"]), "source": "GOG", "name": m["name"]}
+                if e.endswith(".app"):
+                    g["app"] = full
+                games.append(g)
+    return games
+
+
+def appstore_games(dirs=APPSTORE_DIRS):
+    """App Store apps whose category says game (a receipt is required, so launchers/emulators are skipped)."""
+    games = []
+    for d in dirs:
+        try:
+            apps = sorted(n for n in os.listdir(d) if n.endswith(".app"))
+        except OSError:
+            continue
+        for n in apps:
+            contents = os.path.join(d, n, "Contents")
+            if not os.path.exists(os.path.join(contents, "_MASReceipt", "receipt")):
+                continue
+            try:
+                with open(os.path.join(contents, "Info.plist"), "rb") as f:
+                    info = plistlib.load(f)
+            except (OSError, plistlib.InvalidFileException, ValueError):
+                continue
+            if "game" not in str(info.get("LSApplicationCategoryType", "")).lower():
+                continue
+            games.append({"id": "mas:" + str(info.get("CFBundleIdentifier", n)), "source": "App Store",
+                          "name": info.get("CFBundleDisplayName") or info.get("CFBundleName") or n[:-4],
+                          "app": os.path.join(d, n)})
+    return games
+
+
+def library_games():
+    """Installed games from Steam, Epic, GOG and the App Store: [{id, source, name, app?, uri?, icon?}]."""
+    games = []
+    for g in steam_games():
+        item = {"id": "steam:" + g["appid"], "source": "Steam", "name": g["name"]}
+        if g.get("app"):
+            item["app"] = g["app"]
+        icon = os.path.join(STEAM_ROOT, "appcache", "librarycache", g["appid"], "library_600x900.jpg")
+        if os.path.isfile(icon):  # local cache only, nothing is downloaded
+            item["icon"] = icon
+        games.append(item)
+    games += epic_games() + gog_games() + appstore_games()
+    return sorted(games, key=lambda g: (g["name"].lower(), g["id"]))
+
+
+def play_game(ident, via_steam, st):
+    """Launch an installed game by id (`steam:<appid>`, `epic:<app>`, `gog:<id>`, `mas:<bundle>`; bare digits = Steam).
+    Steam games: start Steam first if needed, then run the .app directly. Others: .app, else their URI."""
+    ident = "steam:" + ident if str(ident).isdigit() else str(ident)
+    game = next((g for g in library_games() if g["id"] == ident), None)
     if not game:
         return False
-    ensure_steam(st)
-    if game.get("app") and not via_steam:
+    if game["source"] == "Steam":
+        ensure_steam(st)
+        if game.get("app") and not via_steam:
+            log("launching %s directly" % game["name"])
+            sh(["open", "-a", game["app"]], timeout=20)
+        else:
+            log("launching %s via Steam" % game["name"])
+            sh(["open", "steam://rungameid/%s" % ident.split(":", 1)[1]], timeout=20)
+        return True
+    if game.get("uri"):
+        log("launching %s via %s" % (game["name"], game["source"]))
+        sh(["open", game["uri"]], timeout=20)
+    elif game.get("app"):
         log("launching %s directly" % game["name"])
         sh(["open", "-a", game["app"]], timeout=20)
     else:
-        log("launching %s via Steam" % game["name"])
-        sh(["open", "steam://rungameid/%s" % game["appid"]], timeout=20)
+        return False
     return True
 
 
 def cmd_play(args):
-    if not play_game(args.appid, args.via_steam, load_config()["settings"]):
-        sys.exit("No installed Steam game with appid %s (see `gamefocus.py games`)." % args.appid)
+    if not play_game(args.game, args.via_steam, load_config()["settings"]):
+        sys.exit("No launchable installed game '%s' (see `gamefocus.py games`)." % args.game)
 
 
 def cmd_games(args):
-    games = steam_games()
+    games = library_games()
     if args.json:
         print(json.dumps(games))
     else:
         for g in games:
-            print("%10s  %s" % (g["appid"], g["name"]))
+            print("%-22s %-10s %s" % (g["id"], g["source"], g["name"]))
         if not games:
-            print("No installed Steam games found.")
+            print("No installed games found.")
 
 
 def cmd_resume_all(args):
@@ -923,11 +1030,11 @@ def main():
     f.add_argument("--args", action="store_true", help="match against full command line")
     f.set_defaults(fn=cmd_find)
     sub.add_parser("status", help="show pending snapshot").set_defaults(fn=cmd_status)
-    g = sub.add_parser("games", help="list installed Steam games")
+    g = sub.add_parser("games", help="list installed games (Steam, Epic, GOG, App Store)")
     g.add_argument("--json", action="store_true")
     g.set_defaults(fn=cmd_games)
-    pl = sub.add_parser("play", help="launch an installed Steam game (starts Steam first if needed)")
-    pl.add_argument("appid")
+    pl = sub.add_parser("play", help="launch an installed game (starts Steam first for Steam games)")
+    pl.add_argument("game", help="id from `games` (steam:<appid>, epic:..., gog:..., mas:...); bare digits = Steam")
     pl.add_argument("--via-steam", action="store_true", help="use steam://rungameid instead of the game's .app")
     pl.set_defaults(fn=cmd_play)
     sub.add_parser("resume-all", help="EMERGENCY: undo every pause/demote now").set_defaults(fn=cmd_resume_all)

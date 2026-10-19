@@ -1,4 +1,6 @@
+import json
 import os
+import plistlib
 import sys
 import tempfile
 import unittest
@@ -339,22 +341,27 @@ class SteamGames(unittest.TestCase):
 
 
 STEAM_APP = {"name": "Steam", "bundle": "com.valvesoftware.steam", "pid": 7}
-GAME = {"appid": "9", "name": "G", "app": "/x/G.app"}
+GAME = {"id": "steam:9", "source": "Steam", "name": "G", "app": "/x/G.app"}
 
 
 class Play(IsolatedHome):
-    def play(self, running_seq, game=GAME, via_steam=False):
+    def play(self, running_seq, game=GAME, ident="steam:9", via_steam=False):
         calls = []
         seq = iter(running_seq)
-        with mock.patch.object(gf, "steam_games", return_value=[game]), \
+        with mock.patch.object(gf, "library_games", return_value=[game]), \
              mock.patch.object(gf, "list_apps", side_effect=lambda: next(seq)), \
              mock.patch.object(gf, "sh", side_effect=lambda c, timeout=30: calls.append(c) or (0, "", "")), \
              mock.patch.object(gf.time, "sleep", side_effect=lambda s: calls.append(["sleep", s])):
-            ok = gf.play_game(game["appid"], via_steam, dict(ST))
+            ok = gf.play_game(ident, via_steam, dict(ST))
         return ok, calls
 
     def test_steam_running_launches_app_directly_no_steam_open(self):
         ok, calls = self.play([[STEAM_APP]])
+        self.assertTrue(ok)
+        self.assertEqual(calls, [["open", "-a", "/x/G.app"]])
+
+    def test_bare_appid_means_steam(self):
+        ok, calls = self.play([[STEAM_APP]], ident="9")
         self.assertTrue(ok)
         self.assertEqual(calls, [["open", "-a", "/x/G.app"]])
 
@@ -368,12 +375,82 @@ class Play(IsolatedHome):
     def test_via_steam_or_no_app_uses_url(self):
         _, calls = self.play([[STEAM_APP]], via_steam=True)
         self.assertEqual(calls, [["open", "steam://rungameid/9"]])
-        _, calls = self.play([[STEAM_APP]], game={"appid": "9", "name": "G"})
+        _, calls = self.play([[STEAM_APP]], game={"id": "steam:9", "source": "Steam", "name": "G"})
         self.assertEqual(calls, [["open", "steam://rungameid/9"]])
 
+    def test_non_steam_games_never_start_steam(self):
+        gog = {"id": "gog:5", "source": "GOG", "name": "X", "app": "/g/X.app"}
+        ok, calls = self.play([], game=gog, ident="gog:5")  # list_apps must not be called
+        self.assertTrue(ok)
+        self.assertEqual(calls, [["open", "-a", "/g/X.app"]])
+        epic = {"id": "epic:Sugar", "source": "Epic Games", "name": "E",
+                "uri": "com.epicgames.launcher://apps/Sugar?action=launch&silent=true"}
+        _, calls = self.play([], game=epic, ident="epic:Sugar")
+        self.assertEqual(calls, [["open", epic["uri"]]])
+
     def test_unknown_game_is_false(self):
-        with mock.patch.object(gf, "steam_games", return_value=[]):
-            self.assertFalse(gf.play_game("1", False, dict(ST)))
+        with mock.patch.object(gf, "library_games", return_value=[]):
+            self.assertFalse(gf.play_game("steam:1", False, dict(ST)))
+
+
+class Importers(unittest.TestCase):
+    def test_epic_manifests(self):
+        with tempfile.TemporaryDirectory() as d:
+            with open(os.path.join(d, "a.item"), "w") as f:
+                json.dump({"DisplayName": "Fortnite-ish", "InstallLocation": "/e/F", "AppName": "Sugar",
+                           "LaunchExecutable": "F.app"}, f)
+            with open(os.path.join(d, "bad.item"), "w") as f:
+                f.write("{not json")
+            with open(os.path.join(d, "noname.item"), "w") as f:
+                json.dump({"InstallLocation": "/x"}, f)
+            games = gf.epic_games(d)
+        self.assertEqual(len(games), 1)
+        self.assertEqual((games[0]["id"], games[0]["source"], games[0]["name"]), ("epic:Sugar", "Epic Games", "Fortnite-ish"))
+        self.assertEqual(games[0]["uri"], "com.epicgames.launcher://apps/Sugar?action=launch&silent=true")
+
+    def test_gog_info_inside_app_bundle_and_plain_dir(self):
+        with tempfile.TemporaryDirectory() as d:
+            res = os.path.join(d, "Thing.app", "Contents", "Resources")
+            os.makedirs(res)
+            with open(os.path.join(res, "goggame-123.info"), "w") as f:
+                json.dump({"gameId": "123", "name": "Thing"}, f)
+            os.makedirs(os.path.join(d, "Plain"))
+            with open(os.path.join(d, "Plain", "goggame-9.info"), "w") as f:
+                json.dump({"gameId": "9", "name": "Plain Game"}, f)
+            games = {g["id"]: g for g in gf.gog_games([d])}
+        self.assertEqual(games["gog:123"]["app"], os.path.join(d, "Thing.app"))
+        self.assertNotIn("app", games["gog:9"])
+
+    def test_appstore_needs_game_category_and_receipt(self):
+        with tempfile.TemporaryDirectory() as d:
+            def mk(name, cat, receipt):
+                c = os.path.join(d, name + ".app", "Contents")
+                os.makedirs(c)
+                with open(os.path.join(c, "Info.plist"), "wb") as f:
+                    plistlib.dump({"CFBundleName": name, "CFBundleIdentifier": "id." + name,
+                                   **({"LSApplicationCategoryType": cat} if cat else {})}, f)
+                if receipt:
+                    os.makedirs(os.path.join(c, "_MASReceipt"))
+                    open(os.path.join(c, "_MASReceipt", "receipt"), "w").close()
+            mk("Good", "public.app-category.arcade-games", True)
+            mk("NoReceipt", "public.app-category.games", False)
+            mk("NotGame", "public.app-category.productivity", True)
+            mk("NoCategory", None, True)
+            games = gf.appstore_games([d])
+        self.assertEqual([g["name"] for g in games], ["Good"])
+        self.assertEqual(games[0]["app"], os.path.join(d, "Good.app"))
+
+    def test_library_merges_sources_sorted_and_steam_gets_local_icon(self):
+        steam = [{"appid": "1", "name": "Zed", "app": "/s/Zed.app"}]
+        with mock.patch.object(gf, "steam_games", return_value=steam), \
+             mock.patch.object(gf, "epic_games", return_value=[{"id": "epic:a", "source": "Epic Games", "name": "Alpha"}]), \
+             mock.patch.object(gf, "gog_games", return_value=[]), \
+             mock.patch.object(gf, "appstore_games", return_value=[]), \
+             mock.patch.object(gf.os.path, "isfile", side_effect=lambda p: p.endswith("1/library_600x900.jpg")):
+            lib = gf.library_games()
+        self.assertEqual([g["id"] for g in lib], ["epic:a", "steam:1"])
+        self.assertTrue(lib[1]["icon"].endswith("1/library_600x900.jpg"))
+        self.assertNotIn("icon", lib[0])
 
 
 class Watch(unittest.TestCase):

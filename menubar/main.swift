@@ -38,7 +38,7 @@ func spawnDetached(_ args: [String]) {
     try? p.run()
 }
 
-func steamGames() -> [[String: String]] {
+func libraryGames() -> [[String: String]] {
     let p = Process()
     p.executableURL = URL(fileURLWithPath: python)
     p.arguments = [scriptPath, "games", "--json"]
@@ -91,15 +91,20 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate {
         menu.addItem(withTitle: watching ? "Watching\(dry ? " (dry-run)" : "")" : "Not watching", action: nil, keyEquivalent: "")
         menu.addItem(withTitle: snapshotSummary() ?? "No active session", action: nil, keyEquivalent: "")
         menu.addItem(.separator())
-        let playItem = menu.addItem(withTitle: "Play Steam game", action: nil, keyEquivalent: "")
+        let playItem = menu.addItem(withTitle: "Play game", action: nil, keyEquivalent: "")
         let sub = NSMenu()
-        let games = steamGames()
+        let games = libraryGames()
         for g in games {
-            let gi = sub.addItem(withTitle: g["name"] ?? "?", action: #selector(play(_:)), keyEquivalent: "")
+            let suffix = g["source"] == "Steam" ? "" : "  (\(g["source"] ?? "?"))"
+            let gi = sub.addItem(withTitle: (g["name"] ?? "?") + suffix, action: #selector(play(_:)), keyEquivalent: "")
+            if let path = g["icon"], let img = NSImage(contentsOfFile: path) { // local Steam library cache only
+                img.size = NSSize(width: 16, height: 24)
+                gi.image = img
+            }
             gi.target = self
             gi.representedObject = g
         }
-        if games.isEmpty { sub.addItem(withTitle: "No installed Steam games found", action: nil, keyEquivalent: "") }
+        if games.isEmpty { sub.addItem(withTitle: "No installed games found", action: nil, keyEquivalent: "") }
         playItem.submenu = sub
         menu.addItem(.separator())
         let v = add(menu, "Always launch via Steam (for DRM games)", #selector(toggleViaSteam))
@@ -134,10 +139,9 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     // Playing from here starts `watch` first (if off), so the profile frees RAM when the game process appears.
     @objc func play(_ sender: NSMenuItem) {
-        guard let g = sender.representedObject as? [String: String], let id = g["appid"],
-              id.allSatisfy({ $0.isNumber }) else { return }
+        guard let g = sender.representedObject as? [String: String], let id = g["id"], !id.isEmpty else { return }
         if !isWatching() { toggleWatch() }
-        // All launch logic (start Steam if needed, then run the game's .app directly) lives in `gamefocus.py play`.
+        // All launch logic (Steam first if needed, then the .app or URI) lives in `gamefocus.py play`.
         spawnDetached(["play", id] + (UserDefaults.standard.bool(forKey: "viaSteam") ? ["--via-steam"] : []))
     }
 

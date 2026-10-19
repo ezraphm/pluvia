@@ -12,7 +12,8 @@ python3 gamefocus.py run <profile> --dry-run
 python3 gamefocus.py run <profile>         # quit apps, wait for game, restore
 python3 gamefocus.py resume-all            # EMERGENCY: undo every pause/demote (SIGCONT, taskpolicy -B)
 python3 gamefocus.py status | restore      # pending snapshot / crash recovery
-python3 gamefocus.py games [--json]         # installed Steam games (appmanifest_*.acf)
+python3 gamefocus.py games [--json]         # installed games: Steam, Epic, GOG, App Store
+python3 gamefocus.py play <id>              # steam:<appid> | epic:<app> | gog:<id> | mas:<bundle>
 python3 gamefocus.py watch [--dry-run]    # auto-run profiles with "watch": true when their game starts
 python3 -m unittest discover -s tests
 ```
@@ -47,4 +48,10 @@ Not verified: RAM actually freed (only `ps` RSS estimates), FPS effect, Automati
 ## Menu bar app
 `menubar/build.sh` builds `menubar/build/GameON.app` (needs `swiftc`; the app bundles a copy of `gamefocus.py`,
 so rebuild after changing it). It is a thin shell: Start/Stop watching (+ dry-run toggle), Restore now,
-Play Steam game (lists installed games via `gamefocus.py games`, starts `watch` if off, then `gamefocus.py play <appid>`: starts Steam in the background if it is not running, then launches the game's `.app` directly (`steam://rungameid/<id>` only for "Always launch via Steam" or when no single `.app` exists)), EMERGENCY Resume all, open config/log, Start at login (LaunchAgent). Stop watch CLI instances first: two watchers race.
+Play game (lists installed games via `gamefocus.py games`, Steam covers from the local `appcache/librarycache`, starts `watch` if off, then `gamefocus.py play <appid>`: starts Steam in the background if it is not running, then launches the game's `.app` directly (`steam://rungameid/<id>` only for "Always launch via Steam" or when no single `.app` exists)), EMERGENCY Resume all, open config/log, Start at login (LaunchAgent). Stop watch CLI instances first: two watchers race.
+
+## Credits
+Epic/GOG/App Store library detection is a Python port of the importers in
+[Aether](https://github.com/VibeNoobNotFound/Aether) (MIT, (c) 2026 VibeNoobNotFound). Epic/GOG are untested on
+real installs here (none installed); they are covered by fixture tests only. To auto-free RAM for non-Steam games,
+add a `watch` profile whose `game.match` matches their install path.
