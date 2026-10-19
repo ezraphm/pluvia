@@ -626,9 +626,11 @@ def cmd_init(args):
 
 
 def running_apps_json():
-    ram = ram_by_pid()
+    ram, ancestors = ram_by_pid(), ancestor_pids()
     return [{"name": a["name"], "bundle": a.get("bundle"), "ram_mb": round(ram.get(a["pid"], 0))}
-            for a in list_apps()]
+            for a in list_apps()  # same protection as select_targets: never offer what would be skipped
+            if (a.get("bundle") or "").lower() not in NEVER_QUIT and a["name"].lower() not in NEVER_QUIT
+            and a["pid"] not in ancestors]
 
 
 def cmd_list(args):

@@ -536,9 +536,18 @@ class LibraryWatch(unittest.TestCase):
              mock.patch.object(gf, "appstore_games", return_value=[]):
             self.assertEqual(gf.library_games()[0]["path"], "/S/steamapps/common/One")
 
+    def test_list_json_hides_protected_apps_and_our_own_ancestors(self):
+        apps = [{"name": "Finder", "bundle": "com.apple.finder", "pid": 1},
+                {"name": "Term", "bundle": "x.term", "pid": 2},
+                {"name": "Slack", "bundle": "s.l", "pid": 3}]
+        with mock.patch.object(gf, "list_apps", return_value=apps), mock.patch.object(gf, "ram_by_pid", return_value={}), \
+             mock.patch.object(gf, "ancestor_pids", return_value={2}):
+            self.assertEqual([a["name"] for a in gf.running_apps_json()], ["Slack"])
+
     def test_list_json_shape(self):
         apps = [{"name": "A", "bundle": "a.b", "pid": 5}]
-        with mock.patch.object(gf, "list_apps", return_value=apps), mock.patch.object(gf, "ram_by_pid", return_value={5: 12.4}):
+        with mock.patch.object(gf, "list_apps", return_value=apps), mock.patch.object(gf, "ram_by_pid", return_value={5: 12.4}), \
+             mock.patch.object(gf, "ancestor_pids", return_value=set()):
             self.assertEqual(gf.running_apps_json(), [{"name": "A", "bundle": "a.b", "ram_mb": 12}])
 
 
