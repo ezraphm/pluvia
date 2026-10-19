@@ -10,6 +10,7 @@ python3 gamefocus.py list                  # running apps + approx RAM
 python3 gamefocus.py find "regex"          # test game-process match (ps comm)
 python3 gamefocus.py run <profile> --dry-run
 python3 gamefocus.py run <profile>         # quit apps, wait for game, restore
+python3 gamefocus.py resume-all            # EMERGENCY: undo every pause/demote (SIGCONT, taskpolicy -B)
 python3 gamefocus.py status | restore      # pending snapshot / crash recovery
 python3 gamefocus.py watch [--dry-run]    # auto-run profiles with "watch": true when their game starts
 python3 -m unittest discover -s tests
@@ -17,6 +18,13 @@ python3 -m unittest discover -s tests
 
 Config: `game.match` is a regex on the executable **path** (`ps comm=`), not the bundle id
 (`find` first). `quit[].restore` = `auto` | `late` | `manual`; a typo is a config error.
+
+## Actions per app
+`quit[].action` = `quit` (default) | `demote` (`taskpolicy -b`: E-cores, low IO) | `pause` (SIGSTOP the app's
+process tree, RAM is NOT freed) | `keep`. Undone automatically on restore, and by a watchdog at the next
+`run`/`watch` start if a session crashed. `pause`/`demote` are refused for a built-in safelist (Steam, Discord,
+Zoom, Teams, FaceTime, Slack, Spotify, Music, OBS, torrent clients, game launchers) and never touch other users'
+or system processes (WindowServer, coreaudiod, ...). Only processes in the app's own tree are signalled.
 
 ## Watch (auto trigger)
 Opt-in per profile: `"watch": true` + `game.match`. Fires after 2 consecutive polls (3s apart) with a match,
@@ -32,4 +40,5 @@ then quits apps, waits for the game to exit, restores. Launcher style: one profi
 ## Verified on a real Mac mini (M1, 8GB)
 Verified: list/find/dry-run, quit via osascript, game detection and exit, `open -g` restore of Aside,
 `sysctl kern.memorystatus_vm_pressure_level` readable, JXA frontmost app readable.
+Also verified (on a throwaway `sleep`): SIGSTOP/SIGCONT, `taskpolicy -b/-B` without sudo, `resume-all` after a simulated crash.
 Not verified: RAM actually freed (only `ps` RSS estimates), FPS effect, Automation prompt wording.

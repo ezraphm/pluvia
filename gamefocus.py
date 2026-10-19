@@ -62,6 +62,25 @@ DEFAULT_SETTINGS = {
 }
 
 RESTORE_MODES = ("auto", "late", "manual")
+ACTIONS = ("keep", "demote", "pause", "quit")
+
+# Apps that must keep running at full speed while gaming: voice chat, meetings, music, downloads,
+# and the game launcher. pause/demote on these is refused (an explicit `quit` is still the user's call).
+FREEZE_SAFE = set(b.lower() for b in [
+    "com.valvesoftware.steam", "com.hnc.Discord", "us.zoom.xos", "com.microsoft.teams",
+    "com.microsoft.teams2", "com.apple.FaceTime", "com.tinyspeck.slackmacgap",
+    "com.spotify.client", "com.apple.Music", "com.apple.podcasts", "com.obsproject.obs-studio",
+    "org.m0k.transmission", "org.qbittorrent.qBittorrent", "com.epicgames.EpicGamesLauncher",
+    "net.battle.app", "com.apple.TimeMachine",
+])
+
+# Never signal or re-prioritize these, even when they appear inside an app's process tree.
+SYSTEM_PROCS = set(n.lower() for n in [
+    "WindowServer", "coreaudiod", "audiomxd", "launchd", "loginwindow", "Dock", "Finder",
+    "kernel_task", "SystemUIServer", "ControlCenter", "WindowManager", "bluetoothd", "hidd",
+    "powerd", "logd", "notifyd", "cfprefsd", "distnoted", "usernoted", "coreservicesd",
+    "tccd", "securityd", "trustd", "mds", "mds_stores", "UserEventAgent", "universalaccessd",
+])
 
 DEFAULT_CONFIG = {
     "_help": [
@@ -183,6 +202,36 @@ def ram_by_pid():
             stack.extend(kids.get(cur, []))
         totals[pid] = total / 1024.0
     return totals
+
+
+def proc_table():
+    """{pid: (ppid, uid, comm)} for every process."""
+    rc, out, _ = sh(["ps", "-axo", "pid=,ppid=,uid=,comm="])
+    table = {}
+    for line in out.splitlines():
+        p = line.split(None, 3)
+        if len(p) == 4 and p[0].isdigit() and p[1].isdigit() and p[2].isdigit():
+            table[int(p[0])] = (int(p[1]), int(p[2]), p[3])
+    return table
+
+
+def process_tree(pid, table, skip=()):
+    """The app's pid plus descendants, minus other users' and system processes, minus `skip`."""
+    kids = {}
+    for p, (pp, _, _) in table.items():
+        kids.setdefault(pp, []).append(p)
+    out, stack, seen = [], [pid], set()
+    while stack:
+        cur = stack.pop()
+        if cur in seen or cur not in table:
+            continue
+        seen.add(cur)
+        stack.extend(kids.get(cur, []))
+        _, uid, comm = table[cur]
+        if uid == os.getuid() and os.path.basename(comm).lower() not in SYSTEM_PROCS \
+                and cur != os.getpid() and cur not in skip:
+            out.append(cur)
+    return sorted(out)
 
 
 def ancestor_pids():
@@ -336,6 +385,9 @@ def validate_config(cfg):
                 continue
             if not isinstance(e, dict) or not isinstance(e.get("app"), str) or not e["app"]:
                 errs.append("%s.quit[%d] needs an \"app\" name or bundle id" % (where, i))
+            elif e.get("action", "quit") not in ACTIONS:
+                errs.append("%s.quit[%d] (%s): action=%r, must be one of %s"
+                            % (where, i, e["app"], e["action"], "/".join(ACTIONS)))
             elif e.get("restore", "auto") not in RESTORE_MODES:
                 errs.append("%s.quit[%d] (%s): restore=%r, must be one of %s"
                             % (where, i, e["app"], e["restore"], "/".join(RESTORE_MODES)))
@@ -366,7 +418,7 @@ def norm_entries(raw):
     for e in raw:
         if isinstance(e, str):
             e = {"app": e}
-        out.append({"app": e["app"], "restore": e.get("restore", "auto")})
+        out.append({"app": e["app"], "restore": e.get("restore", "auto"), "action": e.get("action", "quit")})
     return out
 
 
@@ -394,6 +446,7 @@ def select_targets(apps, quit_entries, keep):
     protected = set(NEVER_QUIT) | set(k.lower() for k in keep)
     ancestors = ancestor_pids()
     ram = ram_by_pid()
+    table = None
     targets, notes = [], []
     for e in quit_entries:
         found = [a for a in apps if app_matches(a, e["app"])]
@@ -401,13 +454,66 @@ def select_targets(apps, quit_entries, keep):
             notes.append("%s: not running, skipped" % e["app"])
             continue
         a = found[0]
-        if (a.get("bundle") or "").lower() in protected or a["name"].lower() in protected \
-                or a["pid"] in ancestors:
-            notes.append("%s: protected, will NOT be quit" % a["name"])
+        bundle = (a.get("bundle") or "").lower()
+        if bundle in protected or a["name"].lower() in protected or a["pid"] in ancestors:
+            notes.append("%s: protected, will NOT be touched" % a["name"])
             continue
-        targets.append({"name": a["name"], "bundle": a.get("bundle"), "pid": a["pid"],
-                        "restore": e["restore"], "ram_mb": round(ram.get(a["pid"], 0))})
+        action = e["action"]
+        if action == "keep":
+            notes.append("%s: keep, left alone" % a["name"])
+            continue
+        t = {"name": a["name"], "bundle": a.get("bundle"), "pid": a["pid"], "action": action,
+             "restore": e["restore"], "ram_mb": round(ram.get(a["pid"], 0))}
+        if action in ("pause", "demote"):
+            if bundle in FREEZE_SAFE:
+                notes.append("%s: on the safelist (voice/meeting/music/download/launcher), %s refused"
+                             % (a["name"], action))
+                continue
+            table = table or proc_table()
+            t["pids"] = process_tree(a["pid"], table, skip=ancestors)
+            if not t["pids"]:
+                notes.append("%s: no eligible processes to %s" % (a["name"], action))
+                continue
+        targets.append(t)
     return targets, notes
+
+
+def apply_action(t, undo=False):
+    """pause: SIGSTOP/SIGCONT. demote: taskpolicy -b/-B (E-cores, low IO). quit: nothing to do here."""
+    act = t.get("action", "quit")
+    for pid in t.get("pids", []):
+        if act == "pause":
+            try:
+                os.kill(pid, signal.SIGCONT if undo else signal.SIGSTOP)
+            except (ProcessLookupError, PermissionError):
+                pass
+        elif act == "demote":
+            sh(["taskpolicy", "-B" if undo else "-b", "-p", str(pid)])
+
+
+def undo_action(t):
+    apply_action(t, undo=True)
+
+
+def is_freeze(e):
+    return e.get("action", "quit") in ("pause", "demote")  # old snapshots have no action == quit
+
+
+def resume_frozen():
+    """Undo every pause/demote recorded in the snapshot; keep quit entries for `restore`. Returns count."""
+    snap = load_snapshot()
+    if not snap:
+        return 0
+    frozen = [e for e in snap["apps"] if is_freeze(e)]
+    for e in frozen:
+        undo_action(e)
+    if frozen:
+        rest = [e for e in snap["apps"] if not is_freeze(e)]
+        if rest:
+            save_snapshot(snap.get("profile"), rest)
+        elif os.path.exists(SNAPSHOT):
+            os.remove(SNAPSHOT)
+    return len(frozen)
 
 
 def quit_targets(targets, timeout):
@@ -427,6 +533,13 @@ def quit_targets(targets, timeout):
 def restore(cfg, snap):
     st = cfg["settings"]
     entries = snap.get("apps", [])
+    frozen = [e for e in entries if is_freeze(e)]
+    if frozen:
+        for e in frozen:
+            log("resuming %s (%s)" % (e["name"], e["action"]))
+            undo_action(e)
+        entries = [e for e in entries if not is_freeze(e)]
+        save_snapshot(snap.get("profile"), entries)
     running = list_apps()
     order = [e for e in entries if e["restore"] == "auto"] + [e for e in entries if e["restore"] == "late"]
     manual = [e for e in entries if e["restore"] == "manual"]
@@ -492,6 +605,13 @@ def cmd_find(args):
     print("matches: %s" % (pids or "none"))
 
 
+def cmd_resume_all(args):
+    n = resume_frozen()
+    print("Resumed %d paused/demoted app(s)." % n)
+    if load_snapshot():
+        print("Apps that were quit are still pending. Run:  python3 gamefocus.py restore")
+
+
 def cmd_status(args):
     snap = load_snapshot()
     if not snap:
@@ -499,7 +619,7 @@ def cmd_status(args):
         return
     print("Pending snapshot (profile %s, %s):" % (snap.get("profile"), snap.get("created")))
     for e in snap["apps"]:
-        print("  - %s [%s]" % (e["name"], e["restore"]))
+        print("  - %s [%s, restore=%s]" % (e["name"], e.get("action", "quit"), e["restore"]))
     print("Run:  python3 gamefocus.py restore")
 
 
@@ -518,6 +638,10 @@ def cmd_run(args):
     prof = cfg["profiles"].get(args.profile)
     if not prof:
         sys.exit("Unknown profile '%s'. Available: %s" % (args.profile, ", ".join(cfg["profiles"]) or "none"))
+    if not args.dry_run:
+        n = resume_frozen()  # watchdog: a crashed session may have left apps paused/demoted
+        if n:
+            log("watchdog: resumed %d frozen app(s) from an earlier session" % n)
     if load_snapshot() and not args.dry_run:
         sys.exit("A previous snapshot is still pending. Run `python3 gamefocus.py restore` first.")
     st = cfg["settings"]
@@ -528,7 +652,7 @@ def cmd_run(args):
     total = 0
     for t in targets:
         total += t["ram_mb"]
-        print("  quit  %-26s ~%5d MB   restore=%s" % (t["name"], t["ram_mb"], t["restore"]))
+        print("  %-6s%-26s ~%5d MB   restore=%s" % (t["action"], t["name"], t["ram_mb"], t["restore"]))
     for n in notes:
         print("  note  " + n)
     print("  ~%d MB should be freed (rough estimate)" % total)
@@ -554,13 +678,18 @@ def run_session(cfg, name, prof, targets, launch=True):
     snap = None
     try:
         if targets:
-            save_snapshot(name, targets)  # BEFORE quitting
-            done, stuck = quit_targets(targets, st["quit_timeout"])
-            save_snapshot(name, done)     # only restore what we really quit
-            snap = {"profile": name, "apps": done}
+            save_snapshot(name, targets)  # BEFORE touching anything
+            frozen = [t for t in targets if t["action"] != "quit"]
+            quits = [t for t in targets if t["action"] == "quit"]
+            for t in frozen:
+                log("%s %s (%d process(es))" % (t["action"], t["name"], len(t["pids"])))
+                apply_action(t)
+            done = quit_targets(quits, st["quit_timeout"])[0] if quits else []
+            save_snapshot(name, frozen + done)  # only undo what we really changed
+            snap = {"profile": name, "apps": frozen + done}
             if done:
                 time.sleep(2)
-        log("%d app(s) closed" % len(snap["apps"]) if snap else "no apps closed")
+        log("%d app(s) closed/frozen" % len(snap["apps"]) if snap else "no apps changed")
 
         match, match_args = game.get("match"), game.get("match_args", False)
         if not launch:
@@ -638,6 +767,10 @@ def cmd_watch(args):
     if not names:
         sys.exit('No profile has "watch": true (and a game.match). Add it to a profile first.')
     _install_signals()
+    if not args.dry_run:
+        n = resume_frozen()
+        if n:
+            log("watchdog: resumed %d frozen app(s) from an earlier session" % n)
     log("watching for: %s%s (Ctrl+C to stop)" % (", ".join(names), " [dry-run]" if args.dry_run else ""))
     counts = {}
     try:
@@ -673,6 +806,7 @@ def main():
     f.add_argument("--args", action="store_true", help="match against full command line")
     f.set_defaults(fn=cmd_find)
     sub.add_parser("status", help="show pending snapshot").set_defaults(fn=cmd_status)
+    sub.add_parser("resume-all", help="EMERGENCY: undo every pause/demote now").set_defaults(fn=cmd_resume_all)
     sub.add_parser("restore", help="restore apps from last snapshot").set_defaults(fn=cmd_restore)
     r = sub.add_parser("run", help="quit apps, wait for game, restore")
     r.add_argument("profile")

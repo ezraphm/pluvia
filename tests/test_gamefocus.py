@@ -181,6 +181,96 @@ class Restore(IsolatedHome):
         self.assertEqual(left, ["A", "M"])
 
 
+# pid: (ppid, uid, comm)
+ME = os.getuid()
+TABLE = {
+    200: (1, ME, "/Applications/Heavy.app/Contents/MacOS/Heavy"),
+    201: (200, ME, "/Applications/Heavy.app/Contents/Helper"),
+    202: (201, ME, "/System/Library/PrivateFrameworks/WindowServer"),   # system name under the tree
+    203: (200, 0, "/usr/sbin/rootthing"),                               # other uid
+    300: (1, ME, "/Applications/Discord.app/Contents/MacOS/Discord"),
+}
+FAPPS = [{"name": "Heavy", "bundle": "x.heavy", "pid": 200},
+         {"name": "Discord", "bundle": "com.hnc.Discord", "pid": 300},
+         {"name": "Steam", "bundle": "com.valvesoftware.steam", "pid": 400}]
+
+
+class Actions(IsolatedHome):
+    def select(self, entries):
+        with mock.patch.object(gf, "ancestor_pids", return_value=set()), \
+             mock.patch.object(gf, "ram_by_pid", return_value={}), \
+             mock.patch.object(gf, "proc_table", return_value=TABLE):
+            return gf.select_targets(FAPPS, gf.norm_entries(entries), [])
+
+    def test_action_defaults_to_quit_and_bad_action_is_config_error(self):
+        self.assertEqual(gf.norm_entries(["A"])[0]["action"], "quit")
+        c = {"profiles": {"p": {"quit": [{"app": "A", "action": "freeze"}]}}}
+        self.assertEqual(len(gf.validate_config(c)), 1)
+
+    def test_pause_tree_excludes_system_and_foreign_processes(self):
+        t, _ = self.select([{"app": "Heavy", "action": "pause"}])
+        self.assertEqual(t[0]["action"], "pause")
+        self.assertEqual(t[0]["pids"], [200, 201])
+
+    def test_safelist_refuses_pause_and_demote_but_not_keep_semantics(self):
+        t, notes = self.select([{"app": "Discord", "action": "pause"},
+                                {"app": "Steam", "action": "demote"}])
+        self.assertEqual(t, [])
+        self.assertEqual(len(notes), 2)
+        self.assertIn("safelist", notes[0])
+
+    def test_keep_action_is_never_a_target(self):
+        t, _ = self.select([{"app": "Heavy", "action": "keep"}])
+        self.assertEqual(t, [])
+
+    def test_apply_and_undo_pause_and_demote(self):
+        pause = {"action": "pause", "pids": [1, 2]}
+        demote = {"action": "demote", "pids": [3]}
+        with mock.patch.object(gf.os, "kill") as kill, mock.patch.object(gf, "sh", return_value=(0, "", "")) as sh:
+            gf.apply_action(pause)
+            gf.apply_action(demote)
+            gf.undo_action(pause)
+            gf.undo_action(demote)
+        self.assertEqual(kill.call_args_list, [mock.call(1, gf.signal.SIGSTOP), mock.call(2, gf.signal.SIGSTOP),
+                                                mock.call(1, gf.signal.SIGCONT), mock.call(2, gf.signal.SIGCONT)])
+        self.assertEqual([c.args[0] for c in sh.call_args_list],
+                         [["taskpolicy", "-b", "-p", "3"], ["taskpolicy", "-B", "-p", "3"]])
+
+    def test_undo_ignores_already_dead_pid(self):
+        with mock.patch.object(gf.os, "kill", side_effect=ProcessLookupError):
+            gf.undo_action({"action": "pause", "pids": [9]})
+
+    def test_watchdog_undoes_freezes_keeps_quit_entries(self):
+        gf.save_snapshot("p", [
+            {"name": "A", "action": "pause", "pids": [5], "restore": "auto"},
+            {"name": "B", "action": "demote", "pids": [6], "restore": "auto"},
+            {"name": "C", "bundle": "c", "restore": "auto"}])      # old-format entry == quit
+        with mock.patch.object(gf, "undo_action") as undo:
+            n = gf.resume_frozen()
+        self.assertEqual(n, 2)
+        self.assertEqual(undo.call_count, 2)
+        self.assertEqual([e["name"] for e in gf.load_snapshot()["apps"]], ["C"])
+
+    def test_resume_frozen_removes_snapshot_when_only_freezes(self):
+        gf.save_snapshot("p", [{"name": "A", "action": "pause", "pids": [5], "restore": "auto"}])
+        with mock.patch.object(gf, "undo_action"):
+            gf.resume_frozen()
+        self.assertIsNone(gf.load_snapshot())
+
+    def test_restore_undoes_freezes_before_opening_apps(self):
+        order = []
+        entries = [{"name": "A", "bundle": "a", "action": "pause", "pids": [5], "restore": "auto"},
+                   {"name": "B", "bundle": "b", "restore": "auto"}]
+        gf.save_snapshot("p", entries)
+        with mock.patch.object(gf, "list_apps", return_value=[]), \
+             mock.patch.object(gf, "undo_action", side_effect=lambda e: order.append("undo " + e["name"])), \
+             mock.patch.object(gf, "open_app", side_effect=lambda e: order.append("open " + e["name"]) or True), \
+             mock.patch.object(gf, "wait_until_calm", return_value=True), \
+             mock.patch.object(gf.time, "sleep"):
+            gf.restore({"settings": dict(ST)}, {"profile": "p", "apps": entries})
+        self.assertEqual(order, ["undo A", "open B"])
+
+
 class Watch(unittest.TestCase):
     def test_trigger_needs_consecutive_hits_and_resets_on_gap(self):
         counts = {}
