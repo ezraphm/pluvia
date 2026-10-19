@@ -53,7 +53,7 @@ NEVER_QUIT = set(b.lower() for b in [
 DEFAULT_SETTINGS = {
     "quit_timeout": 20,             # seconds to wait for apps to quit politely
     "start_timeout": 180,           # seconds to wait for the game process to appear
-    "restore_grace_after_game": 10, # seconds to wait after game exits before restoring
+    "restore_grace_after_game": 3,  # seconds to wait after game exits before restoring
     "restore_min_delay": 5,         # min seconds between launching "auto" apps
     "restore_late_min_delay": 15,   # min seconds after launching "late" (heavy) apps
     "restore_max_wait": 90,         # max seconds to wait for the Mac to calm down per app
@@ -431,7 +431,7 @@ def restore(cfg, snap):
     remaining = list(entries)
     log("restoring %d app(s), %d left for you to open manually" % (len(order), len(manual)))
     try:
-        for e in order:
+        for i, e in enumerate(order):
             if any(app_matches(a, e["bundle"] or e["name"]) for a in running):
                 log("%s already running, skipping" % e["name"])
             else:
@@ -439,6 +439,8 @@ def restore(cfg, snap):
                 open_app(e)
             remaining = [r for r in remaining if r is not e]
             save_snapshot(snap.get("profile"), remaining)
+            if i == len(order) - 1:
+                break  # nothing left to launch, no reason to wait for the Mac to settle
             time.sleep(st["restore_late_min_delay"] if e["restore"] == "late" else st["restore_min_delay"])
             if not wait_until_calm(st):
                 log("  system still busy after %ss, moving on" % st["restore_max_wait"])

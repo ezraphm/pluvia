@@ -164,6 +164,13 @@ class Restore(IsolatedHome):
         opened, _ = self.run_restore(running=[{"name": "B", "bundle": "b", "pid": 9}])
         self.assertEqual(opened, ["A"])
 
+    def test_no_wait_after_last_app(self):
+        waits = []
+        self.entries = lambda: [{"name": "B", "bundle": "b", "restore": "auto", "pid": 2, "ram_mb": 1}]
+        opened, _ = self.run_restore(calm_side=lambda *a: waits.append(a) or True)
+        self.assertEqual(opened, ["B"])
+        self.assertEqual(waits, [])
+
     def test_interrupt_keeps_remaining_in_snapshot(self):
         def boom(*a, **k):
             raise KeyboardInterrupt()
