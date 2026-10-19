@@ -453,6 +453,79 @@ class Importers(unittest.TestCase):
         self.assertNotIn("icon", lib[0])
 
 
+PT = {  # pid: (ppid, uid, comm)
+    10: (1, ME, "/Applications/Big.app/Contents/MacOS/Big"),
+    11: (10, ME, "/Applications/Big.app/Contents/Helper"),
+    20: (1, ME, "/opt/homebrew/bin/ollama"),
+    21: (1, ME, "/opt/homebrew/bin/ollama"),
+    22: (1, ME, "/opt/homebrew/bin/tinything"),
+    23: (1, ME, "/usr/libexec/someagent"),
+    24: (1, ME, "/System/Library/CoreServices/sys"),
+    25: (1, 0, "/opt/homebrew/bin/rootthing"),
+    26: (1, ME, "/Users/me/bin/mine"),
+    27: (1, ME, "/Library/Frameworks/WindowServer"),
+}
+RSS = {10: 500, 11: 100, 20: 300, 21: 100, 22: 3, 23: 90, 24: 90, 25: 90, 26: 80, 27: 90}
+
+
+class Processes(unittest.TestCase):
+    def test_groups_background_user_processes_outside_apps(self):
+        with mock.patch.object(gf, "proc_table", return_value=PT), mock.patch.object(gf, "rss_mb_by_pid", return_value=RSS), \
+             mock.patch.object(gf, "ancestor_pids", return_value={26}), mock.patch.object(gf, "_self_pids", return_value={21}):
+            apps = [{"name": "Big", "bundle": "b", "pid": 10}]
+            groups = gf.process_groups(apps)
+        # pid 21 is a gamefocus process (e.g. a running `watch`): never offered, so it can never be frozen
+        self.assertEqual([(g["name"], g["ram_mb"], g["count"]) for g in groups], [("ollama", 300, 1)])
+        self.assertEqual(groups[0]["kind"], "process")
+
+    def test_apps_json_marks_kind_and_hides_apple_agents(self):
+        apps = [{"name": "Safari", "bundle": "x.a", "pid": 1, "policy": 0},
+                {"name": "SideNotes", "bundle": "x.sn", "pid": 2, "policy": 1},
+                {"name": "ControlStrip", "bundle": "com.apple.cs", "pid": 3, "policy": 1}]
+        with mock.patch.object(gf, "list_apps", return_value=apps), mock.patch.object(gf, "ram_by_pid", return_value={}), \
+             mock.patch.object(gf, "ancestor_pids", return_value=set()), \
+             mock.patch.object(gf, "proc_table", return_value={}):
+            self.assertEqual([(a["name"], a["kind"]) for a in gf.running_apps_json()], [("Safari", "app"), ("SideNotes", "agent")])
+
+    def test_agents_inside_another_app_and_our_own_app_are_hidden(self):
+        apps = [{"name": "Aside", "bundle": "a.s", "pid": 10, "policy": 0},
+                {"name": "Aside Daemon", "bundle": "a.d", "pid": 11, "policy": 1},
+                {"name": "GameON", "bundle": "dev.gameon.menubar", "pid": 30, "policy": 1},
+                {"name": "SideNotes", "bundle": "x.sn", "pid": 31, "policy": 1}]
+        with mock.patch.object(gf, "list_apps", return_value=apps), mock.patch.object(gf, "ram_by_pid", return_value={}), \
+             mock.patch.object(gf, "ancestor_pids", return_value=set()), mock.patch.object(gf, "proc_table", return_value=PT):
+            self.assertEqual([a["name"] for a in gf.running_apps_json()], ["Aside", "SideNotes"])
+
+    def test_list_apps_keeps_policy(self):
+        out = '[{"name":"A","bundle":"a","pid":1,"policy":1}]'
+        with mock.patch.object(gf, "sh", return_value=(0, out, "")):
+            self.assertEqual(gf.list_apps()[0]["policy"], 1)
+
+    def test_process_entries_normalize_and_validate(self):
+        e = gf.norm_entries([{"process": "ollama", "action": "pause"}])[0]
+        self.assertEqual((e["process"], e["action"]), ("ollama", "pause"))
+        ok = {"profiles": {"p": {"quit": [{"process": "ollama", "action": "demote"}]}}}
+        self.assertEqual(gf.validate_config(ok), [])
+        bad = {"profiles": {"p": {"quit": [{"process": "ollama", "action": "quit"}, {"process": "x"}]}}}
+        self.assertEqual(len(gf.validate_config(bad)), 2)   # processes cannot be quit; default action is quit
+
+    def test_select_targets_handles_process_entries_by_name(self):
+        with mock.patch.object(gf, "ancestor_pids", return_value=set()), mock.patch.object(gf, "ram_by_pid", return_value={}), \
+             mock.patch.object(gf, "proc_table", return_value=PT), mock.patch.object(gf, "rss_mb_by_pid", return_value=RSS), \
+             mock.patch.object(gf, "_self_pids", return_value=set()):
+            t, notes = gf.select_targets([], gf.norm_entries([{"process": "ollama", "action": "pause"},
+                                                                {"process": "ghost", "action": "pause"}]), [])
+        self.assertEqual([(x["name"], x["action"], x["pids"], x["ram_mb"]) for x in t], [("ollama", "pause", [20, 21], 400)])
+        self.assertIn("not running", notes[0])
+
+    def test_system_looking_agent_is_protected_from_quit(self):
+        apps = [{"name": "ControlStrip", "bundle": "com.apple.cs", "pid": 3, "policy": 1}]
+        with mock.patch.object(gf, "ancestor_pids", return_value=set()), mock.patch.object(gf, "ram_by_pid", return_value={}):
+            t, notes = gf.select_targets(apps, gf.norm_entries(["ControlStrip"]), [])
+        self.assertEqual(t, [])
+        self.assertIn("protected", notes[0])
+
+
 class Watch(unittest.TestCase):
     def test_trigger_needs_consecutive_hits_and_resets_on_gap(self):
         counts = {}
@@ -541,14 +614,16 @@ class LibraryWatch(unittest.TestCase):
                 {"name": "Term", "bundle": "x.term", "pid": 2},
                 {"name": "Slack", "bundle": "s.l", "pid": 3}]
         with mock.patch.object(gf, "list_apps", return_value=apps), mock.patch.object(gf, "ram_by_pid", return_value={}), \
-             mock.patch.object(gf, "ancestor_pids", return_value={2}):
+             mock.patch.object(gf, "ancestor_pids", return_value={2}), \
+             mock.patch.object(gf, "proc_table", return_value={}):
             self.assertEqual([a["name"] for a in gf.running_apps_json()], ["Slack"])
 
     def test_list_json_shape(self):
         apps = [{"name": "A", "bundle": "a.b", "pid": 5}]
         with mock.patch.object(gf, "list_apps", return_value=apps), mock.patch.object(gf, "ram_by_pid", return_value={5: 12.4}), \
-             mock.patch.object(gf, "ancestor_pids", return_value=set()):
-            self.assertEqual(gf.running_apps_json(), [{"name": "A", "bundle": "a.b", "ram_mb": 12}])
+             mock.patch.object(gf, "ancestor_pids", return_value=set()), \
+             mock.patch.object(gf, "proc_table", return_value={}):
+            self.assertEqual(gf.running_apps_json(), [{"name": "A", "bundle": "a.b", "ram_mb": 12, "kind": "app"}])
 
 
 if __name__ == "__main__":

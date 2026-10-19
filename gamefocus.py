@@ -40,6 +40,7 @@ SNAPSHOT = os.path.join(HOME_DIR, "snapshot.json")
 LOGFILE = os.path.join(HOME_DIR, "gamefocus.log")
 
 NEVER_QUIT = set(b.lower() for b in [
+    "dev.gameon.menubar",
     "com.apple.finder",
     "com.apple.dock",
     "com.apple.systemuiserver",
@@ -68,6 +69,8 @@ DEFAULT_SETTINGS = {
 
 RESTORE_MODES = ("auto", "late", "manual")
 ACTIONS = ("keep", "demote", "pause", "quit")
+PROCESS_ACTIONS = ("keep", "demote", "pause")  # a plain process cannot be relaunched safely, so never quit
+SYSTEM_PREFIXES = ("/System/", "/usr/libexec/", "/usr/sbin/", "/sbin/", "/usr/bin/", "/bin/", "/Library/Apple/")
 LIBRARY_SOURCES = ("Steam", "Epic Games", "GOG", "App Store")
 
 # Apps that must keep running at full speed while gaming: voice chat, meetings, music, downloads,
@@ -119,10 +122,10 @@ var apps = $.NSWorkspace.sharedWorkspace.runningApplications;
 var out = [];
 for (var i = 0; i < apps.count; i++) {
   var a = apps.objectAtIndex(i);
-  if (a.activationPolicy != 0) continue;
+  if (a.activationPolicy > 1) continue;  // 0 = regular (Dock), 1 = accessory (menu bar / agents)
   out.push({name: ObjC.unwrap(a.localizedName),
             bundle: ObjC.unwrap(a.bundleIdentifier),
-            pid: a.processIdentifier});
+            pid: a.processIdentifier, policy: a.activationPolicy});
 }
 JSON.stringify(out);
 '''
@@ -166,7 +169,8 @@ def list_apps():
     if rc == 0 and out:
         try:
             return [
-                {"name": a.get("name") or "?", "bundle": a.get("bundle") or None, "pid": int(a["pid"])}
+                {"name": a.get("name") or "?", "bundle": a.get("bundle") or None, "pid": int(a["pid"]),
+                 "policy": int(a.get("policy", 0))}
                 for a in json.loads(out) if "pid" in a
             ]
         except (ValueError, KeyError, TypeError):
@@ -219,6 +223,50 @@ def proc_table():
         if len(p) == 4 and p[0].isdigit() and p[1].isdigit() and p[2].isdigit():
             table[int(p[0])] = (int(p[1]), int(p[2]), p[3])
     return table
+
+
+def rss_mb_by_pid():
+    rc, out, _ = sh(["ps", "-axo", "pid=,rss="])
+    rss = {}
+    for line in out.splitlines():
+        p = line.split()
+        if len(p) == 2 and p[0].isdigit() and p[1].isdigit():
+            rss[int(p[0])] = int(p[1]) / 1024.0
+    return rss
+
+
+def _self_pids():
+    """Every running gamefocus process (a `watch`, the menu bar's helpers): must never be paused or demoted."""
+    rc, out, _ = sh(["ps", "-axo", "pid=,command="])
+    return {int(l.split(None, 1)[0]) for l in out.splitlines() if "gamefocus.py" in l and l.split(None, 1)[0].isdigit()}
+
+
+def is_system_proc(comm):
+    return os.path.basename(comm).lower() in SYSTEM_PROCS or comm.startswith(SYSTEM_PREFIXES)
+
+
+def process_groups(apps, min_mb=15):
+    """Background processes of this user that belong to no listed app and are not system ones,
+    grouped by executable name: [{name, kind, ram_mb, count}] biggest first."""
+    table, rss, ancestors = proc_table(), rss_mb_by_pid(), ancestor_pids() | _self_pids()
+    kids = {}
+    for p, (pp, _, _) in table.items():
+        kids.setdefault(pp, []).append(p)
+    owned, stack = set(), [a["pid"] for a in apps]
+    while stack:
+        cur = stack.pop()
+        if cur not in owned:
+            owned.add(cur)
+            stack.extend(kids.get(cur, []))
+    groups = {}
+    for pid, (_, uid, comm) in table.items():
+        if uid != os.getuid() or pid in owned or pid in ancestors or pid == os.getpid() or is_system_proc(comm):
+            continue
+        g = groups.setdefault(os.path.basename(comm), {"ram": 0.0, "count": 0})
+        g["ram"] += rss.get(pid, 0)
+        g["count"] += 1
+    return sorted(({"name": n, "kind": "process", "ram_mb": round(g["ram"]), "count": g["count"]}
+                   for n, g in groups.items() if g["ram"] >= min_mb), key=lambda x: -x["ram_mb"])
 
 
 def process_tree(pid, table, skip=()):
@@ -403,8 +451,12 @@ def validate_config(cfg):
         for i, e in enumerate(quit_list):
             if isinstance(e, str):
                 continue
-            if not isinstance(e, dict) or not isinstance(e.get("app"), str) or not e["app"]:
-                errs.append("%s.quit[%d] needs an \"app\" name or bundle id" % (where, i))
+            if isinstance(e, dict) and isinstance(e.get("process"), str) and e["process"]:
+                if e.get("action", "quit") not in PROCESS_ACTIONS:
+                    errs.append("%s.quit[%d] (process %s): action must be one of %s (processes are never quit)"
+                                % (where, i, e["process"], "/".join(PROCESS_ACTIONS)))
+            elif not isinstance(e, dict) or not isinstance(e.get("app"), str) or not e["app"]:
+                errs.append("%s.quit[%d] needs an \"app\" name or bundle id (or a \"process\" name)" % (where, i))
             elif e.get("action", "quit") not in ACTIONS:
                 errs.append("%s.quit[%d] (%s): action=%r, must be one of %s"
                             % (where, i, e["app"], e["action"], "/".join(ACTIONS)))
@@ -453,7 +505,11 @@ def norm_entries(raw):
     for e in raw:
         if isinstance(e, str):
             e = {"app": e}
-        out.append({"app": e["app"], "restore": e.get("restore", "auto"), "action": e.get("action", "quit")})
+        item = {"restore": e.get("restore", "auto"), "action": e.get("action", "quit")}
+        for k in ("app", "process"):
+            if e.get(k):
+                item[k] = e[k]
+        out.append(item)
     return out
 
 
@@ -484,13 +540,30 @@ def select_targets(apps, quit_entries, keep):
     table = None
     targets, notes = [], []
     for e in quit_entries:
+        if e.get("process"):
+            table = table or proc_table()
+            name = e["process"].lower()
+            ancestors = ancestors | _self_pids()
+            pids = sorted(p for p, (_, uid, comm) in table.items()
+                          if uid == os.getuid() and os.path.basename(comm).lower() == name and not is_system_proc(comm)
+                          and p not in ancestors and p != os.getpid())
+            if not pids:
+                notes.append("%s: not running, skipped" % e["process"])
+            elif e["action"] == "keep":
+                notes.append("%s: keep, left alone" % e["process"])
+            else:
+                rss = rss_mb_by_pid()
+                targets.append({"name": e["process"], "bundle": None, "pid": pids[0], "action": e["action"],
+                                "restore": "manual", "ram_mb": round(sum(rss.get(p, 0) for p in pids)), "pids": pids})
+            continue
         found = [a for a in apps if app_matches(a, e["app"])]
         if not found:
             notes.append("%s: not running, skipped" % e["app"])
             continue
         a = found[0]
         bundle = (a.get("bundle") or "").lower()
-        if bundle in protected or a["name"].lower() in protected or a["pid"] in ancestors:
+        if bundle in protected or a["name"].lower() in protected or a["pid"] in ancestors \
+                or (a.get("policy", 0) == 1 and bundle.startswith("com.apple.")):
             notes.append("%s: protected, will NOT be touched" % a["name"])
             continue
         action = e["action"]
@@ -626,16 +699,31 @@ def cmd_init(args):
 
 
 def running_apps_json():
-    ram, ancestors = ram_by_pid(), ancestor_pids()
-    return [{"name": a["name"], "bundle": a.get("bundle"), "ram_mb": round(ram.get(a["pid"], 0))}
-            for a in list_apps()  # same protection as select_targets: never offer what would be skipped
-            if (a.get("bundle") or "").lower() not in NEVER_QUIT and a["name"].lower() not in NEVER_QUIT
-            and a["pid"] not in ancestors]
+    """Quit/pause/demote candidates: regular apps and menu bar agents (not protected, not ours)."""
+    ram, ancestors, apps = ram_by_pid(), ancestor_pids(), list_apps()
+    table, inside = proc_table(), set()
+    for a in apps:  # helper agents that live inside another regular app belong to that app
+        if a.get("policy", 0) == 0:
+            inside |= set(process_tree(a["pid"], table)) - {a["pid"]}
+    out = []
+    for a in apps:
+        bundle = (a.get("bundle") or "").lower()
+        agent = a.get("policy", 0) == 1
+        if bundle in NEVER_QUIT or a["name"].lower() in NEVER_QUIT or a["pid"] in ancestors \
+                or (agent and (bundle.startswith("com.apple.") or a["pid"] in inside)):
+            continue  # same protection as select_targets: never offer what would be skipped
+        out.append({"name": a["name"], "bundle": a.get("bundle"), "ram_mb": round(ram.get(a["pid"], 0)),
+                    "kind": "agent" if agent else "app"})
+    return out
+
+
+def running_processes_json():
+    return process_groups(list_apps())
 
 
 def cmd_list(args):
     if args.json:
-        print(json.dumps(running_apps_json()))
+        print(json.dumps(running_processes_json() if args.processes else running_apps_json()))
         return
     apps = list_apps()
     ram = ram_by_pid()
@@ -903,11 +991,11 @@ def cmd_run(args):
     print("Profile: %s" % args.profile)
     total = 0
     for t in targets:
-        total += t["ram_mb"]
-        print("  %-6s%-26s ~%5d MB   restore=%s" % (t["action"], t["name"], t["ram_mb"], t["restore"]))
+        total += t["ram_mb"] if t["action"] == "quit" else 0  # pause/demote do not free RAM
+        print("  %-7s%-26s ~%5d MB   restore=%s" % (t["action"], t["name"], t["ram_mb"], t["restore"]))
     for n in notes:
         print("  note  " + n)
-    print("  ~%d MB should be freed (rough estimate)" % total)
+    print("  ~%d MB by quitting (rough RSS estimate; pause/demote free no RAM)" % total)
     if args.dry_run:
         print("Dry run: nothing changed.")
         return
@@ -1105,6 +1193,7 @@ def main():
     sub.add_parser("init", help="create default config").set_defaults(fn=cmd_init)
     ls = sub.add_parser("list", help="show running apps with approx RAM")
     ls.add_argument("--json", action="store_true")
+    ls.add_argument("--processes", action="store_true", help="with --json: background processes instead of apps")
     ls.set_defaults(fn=cmd_list)
     f = sub.add_parser("find", help="test a game-process regex")
     f.add_argument("regex")

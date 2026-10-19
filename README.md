@@ -28,6 +28,11 @@ process tree, RAM is NOT freed) | `keep`. Undone automatically on restore, and b
 Zoom, Teams, FaceTime, Slack, Spotify, Music, OBS, torrent clients, game launchers) and never touch other users'
 or system processes (WindowServer, coreaudiod, ...). Only processes in the app's own tree are signalled.
 
+## What can be freed
+Preferences lists every running **app**, **menu bar agent** and **background process** (yours only, outside any app,
+never `/System`, `/usr/libexec`, the protected list, or gamefocus itself). Apps: keep/demote/pause/quit. Processes
+(`{"process": "ollama", "action": "pause"}`): keep/demote/pause only, they cannot be relaunched safely.
+
 ## Library auto-detect (all games, no per-game profile)
 ```json
 "library_watch": {"enabled": true, "profile": "library", "sources": ["Steam", "Epic Games", "GOG", "App Store"], "exclude": []}
@@ -56,7 +61,7 @@ Not verified: RAM actually freed (only `ps` RSS estimates), FPS effect, Automati
 ## Menu bar app
 `menubar/build.sh` builds `menubar/build/GameON.app` (needs `swiftc`; the app bundles a copy of `gamefocus.py`,
 so rebuild after changing it). It is a thin shell: Start/Stop watching (+ dry-run toggle), Restore now,
-Play game (lists installed games via `gamefocus.py games`, Steam covers from the local `appcache/librarycache`, starts `watch` if off, then `gamefocus.py play <appid>`: starts Steam in the background if it is not running, then launches the game's `.app` directly (`steam://rungameid/<id>` only for "Always launch via Steam" or when no single `.app` exists)), EMERGENCY Resume all, open config/log, Start at login (LaunchAgent). Stop watch CLI instances first: two watchers race.
+Play game (lists installed games via `gamefocus.py games`, Steam covers from the local `appcache/librarycache`, starts `watch` if off, then `gamefocus.py play <appid>`: starts Steam in the background if it is not running, then launches the game's `.app` directly (`steam://rungameid/<id>` only for "Always launch via Steam" or when no single `.app` exists)), Preferences, EMERGENCY Resume all, open config/log, Start at login (LaunchAgent). Stop watch CLI instances first: two watchers race.
 
 ## Credits
 Epic/GOG/App Store library detection is a Python port of the importers in

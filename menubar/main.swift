@@ -97,6 +97,7 @@ final class Prefs: NSObject {
     var cfg: [String: Any] = [:]
     var games: [[String: Any]] = []
     var running: [[String: Any]] = []
+    var processes: [[String: Any]] = []
     let configPath = home + "/config.json"
 
     var lw: [String: Any] {
@@ -131,6 +132,7 @@ final class Prefs: NSObject {
         lw = l
         games = pythonJSON(["games", "--json"])
         running = pythonJSON(["list", "--json"])
+        processes = pythonJSON(["list", "--json", "--processes"])
     }
 
     func save() {
@@ -233,11 +235,12 @@ final class Prefs: NSObject {
         for (i, e) in list.enumerated() {
             let row = NSStackView()
             row.spacing = 8
-            let name = (e["label"] as? String) ?? (e["app"] as? String) ?? "?"
+            let isProc = e["process"] != nil
+            let name = ((e["label"] as? String) ?? (e["app"] as? String) ?? (e["process"] as? String) ?? "?") + (isProc ? "  (process)" : "")
             let nameLabel = label(name)
             nameLabel.widthAnchor.constraint(equalToConstant: 200).isActive = true
             row.addArrangedSubview(nameLabel)
-            row.addArrangedSubview(popup(actionNames, e["action"] as? String ?? "quit") { v in
+            row.addArrangedSubview(popup(isProc ? ["keep", "demote", "pause"] : actionNames, e["action"] as? String ?? (isProc ? "keep" : "quit")) { v in
                 list[i]["action"] = v; self.quitList = list; self.save(); self.rebuild()
             })
             if (e["action"] as? String ?? "quit") == "quit" {
@@ -252,23 +255,40 @@ final class Prefs: NSObject {
         }
         if list.isEmpty { stack.addArrangedSubview(label("No apps yet: auto-detect will not close anything.", small: true)) }
 
-        let have = Set(list.compactMap { $0["app"] as? String })
-        let addable = running.filter { r in
-            let id = (r["bundle"] as? String) ?? (r["name"] as? String) ?? ""
-            return !have.contains(id) && !id.isEmpty
-        }
+        let have = Set(list.compactMap { ($0["app"] as? String) ?? ($0["process"] as? String) })
+        // Every running app, menu bar agent and background process (protected ones are already filtered out by Python).
+        var choices: [[String: Any]] = []
         let add = NSPopUpButton(frame: .zero, pullsDown: true)
-        add.addItem(withTitle: "Add a running app…")
-        for r in addable {
-            let mb = (r["ram_mb"] as? Int) ?? 0
-            add.addItem(withTitle: "\(r["name"] as? String ?? "?")  (~\(mb) MB)")
+        add.addItem(withTitle: "Add a running app or process…")
+        func section(_ title: String, _ items: [[String: Any]], process: Bool) {
+            let fresh = items.filter { r in
+                let id = process ? (r["name"] as? String) : ((r["bundle"] as? String) ?? (r["name"] as? String))
+                return id != nil && !id!.isEmpty && !have.contains(id!)
+            }.sorted { ($0["ram_mb"] as? Int ?? 0) > ($1["ram_mb"] as? Int ?? 0) }
+            if fresh.isEmpty { return }
+            let h = NSMenuItem.sectionHeader(title: title)
+            add.menu?.addItem(h)
+            for r in fresh {
+                var c = r
+                c["isProcess"] = process
+                let item = NSMenuItem(title: "\(r["name"] as? String ?? "?")  (~\(r["ram_mb"] as? Int ?? 0) MB)", action: nil, keyEquivalent: "")
+                item.tag = choices.count
+                choices.append(c)
+                add.menu?.addItem(item)
+            }
         }
+        section("Apps", running.filter { ($0["kind"] as? String) == "app" }, process: false)
+        section("Menu bar apps & agents", running.filter { ($0["kind"] as? String) == "agent" }, process: false)
+        section("Background processes (pause/demote only)", processes, process: true)
         let addAct = act {
-            let idx = add.indexOfSelectedItem - 1
-            guard idx >= 0, idx < addable.count else { return }
-            let r = addable[idx]
-            list.append(["app": (r["bundle"] as? String) ?? (r["name"] as? String) ?? "", "label": r["name"] as? String ?? "",
-                         "action": "quit", "restore": "auto"])
+            guard let tag = add.selectedItem?.tag, tag >= 0, tag < choices.count else { return }
+            let r = choices[tag]
+            if r["isProcess"] as? Bool == true {
+                list.append(["process": r["name"] as? String ?? "", "label": r["name"] as? String ?? "", "action": "keep"])
+            } else {
+                list.append(["app": (r["bundle"] as? String) ?? (r["name"] as? String) ?? "", "label": r["name"] as? String ?? "",
+                             "action": "quit", "restore": "auto"])
+            }
             self.quitList = list; self.save(); self.rebuild()
         }
         add.target = addAct
