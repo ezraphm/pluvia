@@ -47,4 +47,4 @@ Not verified: RAM actually freed (only `ps` RSS estimates), FPS effect, Automati
 ## Menu bar app
 `menubar/build.sh` builds `menubar/build/GameON.app` (needs `swiftc`; the app bundles a copy of `gamefocus.py`,
 so rebuild after changing it). It is a thin shell: Start/Stop watching (+ dry-run toggle), Restore now,
-Play Steam game (lists installed games via `gamefocus.py games`, starts `watch` if off, then opens `steam://rungameid/<id>`), EMERGENCY Resume all, open config/log, Start at login (LaunchAgent). Stop watch CLI instances first: two watchers race.
+Play Steam game (lists installed games via `gamefocus.py games`, starts `watch` if off, then launches the game's `.app` directly (or `steam://rungameid/<id>` when "Launch via Steam client" is on or no single `.app` exists)), EMERGENCY Resume all, open config/log, Start at login (LaunchAgent). Stop watch CLI instances first: two watchers race.

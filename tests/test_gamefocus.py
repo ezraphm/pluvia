@@ -319,6 +319,21 @@ class SteamGames(unittest.TestCase):
         self.assertEqual([(g["appid"], g["name"]) for g in games],
                          [("909080", "Cube Escape: Paradox"), ("108600", "Project Zomboid")])
 
+    def test_direct_app_path_only_when_exactly_one_app_in_installdir(self):
+        with tempfile.TemporaryDirectory() as a:
+            self.make(a, [("1", "One App", "4"), ("2", "Two Apps", "4"), ("3", "No App", "4")])
+            for appid, dirs in (("1", ["G.app"]), ("2", ["A.app", "B.app"]), ("3", [])):
+                m = os.path.join(a, "steamapps", "appmanifest_%s.acf" % appid)
+                with open(m, "a") as f:
+                    f.write('"installdir" "d%s"\n' % appid)
+                os.makedirs(os.path.join(a, "steamapps", "common", "d" + appid))
+                for d in dirs:
+                    os.makedirs(os.path.join(a, "steamapps", "common", "d" + appid, d))
+            games = {g["appid"]: g for g in gf.steam_games(a)}
+            self.assertEqual(games["1"]["app"], os.path.join(a, "steamapps", "common", "d1", "G.app"))
+            self.assertNotIn("app", games["2"])
+            self.assertNotIn("app", games["3"])
+
     def test_missing_steam_is_empty_not_error(self):
         self.assertEqual(gf.steam_games("/nonexistent/steam"), [])
 

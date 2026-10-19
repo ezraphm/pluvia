@@ -646,12 +646,20 @@ def steam_games(root=STEAM_ROOT):
                     txt = f.read()
             except OSError:
                 continue
-            kv = dict(re.findall(r'"(appid|name|StateFlags)"\s+"([^"]*)"', txt))
+            kv = dict(re.findall(r'"(appid|name|StateFlags|installdir)"\s+"([^"]*)"', txt))
             appid = kv.get("appid", "")
             if appid.isdigit() and appid not in seen and appid not in STEAM_NOT_GAMES \
                     and kv.get("StateFlags", "").isdigit() and int(kv["StateFlags"]) & 4 and kv.get("name"):
                 seen.add(appid)
-                games.append({"appid": appid, "name": kv["name"]})
+                g = {"appid": appid, "name": kv["name"]}
+                install = os.path.join(apps_dir, "common", kv.get("installdir", ""))
+                try:  # direct launch only when the choice is unambiguous
+                    bundles = [d for d in os.listdir(install) if d.endswith(".app")]
+                except OSError:
+                    bundles = []
+                if len(bundles) == 1:
+                    g["app"] = os.path.join(install, bundles[0])
+                games.append(g)
     return sorted(games, key=lambda g: g["name"].lower())
 
 
