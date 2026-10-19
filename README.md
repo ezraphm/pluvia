@@ -28,6 +28,14 @@ process tree, RAM is NOT freed) | `keep`. Undone automatically on restore, and b
 Zoom, Teams, FaceTime, Slack, Spotify, Music, OBS, torrent clients, game launchers) and never touch other users'
 or system processes (WindowServer, coreaudiod, ...). Only processes in the app's own tree are signalled.
 
+## Library auto-detect (all games, no per-game profile)
+```json
+"library_watch": {"enabled": true, "profile": "library", "sources": ["Steam", "Epic Games", "GOG", "App Store"], "exclude": []}
+```
+`watch` matches every installed library game by its install path and applies the `quit` list of `profile`
+(default off; only apps in that list are touched). `watch` reloads config.json when it changes. Menu bar
+**Preferences…** edits all of it (enable, sources, apps + action/restore, excluded games).
+
 ## Watch (auto trigger)
 Opt-in per profile: `"watch": true` + `game.match`. Fires after 2 consecutive polls (3s apart) with a match,
 then quits apps, waits for the game to exit, restores. Launcher style: one profile for all Steam games:

@@ -62,6 +62,237 @@ func snapshotSummary() -> String? {
     return "Session: \(apps.count - frozen) closed, \(frozen) frozen (\(j["profile"] as? String ?? "?"))"
 }
 
+
+// MARK: - Preferences window (edits ~/.gamefocus/config.json; `watch` reloads it live)
+
+final class Act: NSObject {
+    let f: () -> Void
+    init(_ f: @escaping () -> Void) { self.f = f }
+    @objc func go() { f() }
+}
+
+final class FlippedView: NSView { override var isFlipped: Bool { true } }
+
+let allSources = ["Steam", "Epic Games", "GOG", "App Store"]
+let actionNames = ["keep", "demote", "pause", "quit"]
+let restoreNames = ["auto", "late", "manual"]
+
+func pythonJSON(_ args: [String]) -> [[String: Any]] {
+    let p = Process()
+    p.executableURL = URL(fileURLWithPath: python)
+    p.arguments = [scriptPath] + args
+    let pipe = Pipe()
+    p.standardOutput = pipe
+    p.standardError = FileHandle.nullDevice
+    guard (try? p.run()) != nil else { return [] }
+    let data = pipe.fileHandleForReading.readDataToEndOfFile()
+    p.waitUntilExit()
+    return (try? JSONSerialization.jsonObject(with: data)) as? [[String: Any]] ?? []
+}
+
+final class Prefs: NSObject {
+    var window: NSWindow?
+    let stack = NSStackView()
+    var acts: [Act] = []
+    var cfg: [String: Any] = [:]
+    var games: [[String: Any]] = []
+    var running: [[String: Any]] = []
+    let configPath = home + "/config.json"
+
+    var lw: [String: Any] {
+        get { cfg["library_watch"] as? [String: Any] ?? [:] }
+        set { cfg["library_watch"] = newValue }
+    }
+    var profileName: String { lw["profile"] as? String ?? "library" }
+    var quitList: [[String: Any]] {
+        get { ((cfg["profiles"] as? [String: Any])?[profileName] as? [String: Any])?["quit"] as? [[String: Any]] ?? [] }
+        set {
+            var profiles = cfg["profiles"] as? [String: Any] ?? [:]
+            var prof = profiles[profileName] as? [String: Any] ?? [:]
+            prof["quit"] = newValue
+            profiles[profileName] = prof
+            cfg["profiles"] = profiles
+        }
+    }
+
+    func load() {
+        try? FileManager.default.createDirectory(atPath: home, withIntermediateDirectories: true)
+        if let d = FileManager.default.contents(atPath: configPath),
+           let j = try? JSONSerialization.jsonObject(with: d) as? [String: Any] { cfg = j }
+        else { cfg = ["settings": [String: Any](), "keep": [Any](), "profiles": [String: Any]()] }
+        var profiles = cfg["profiles"] as? [String: Any] ?? [:]
+        var l = lw
+        if l["profile"] == nil { l["profile"] = "library" }
+        if l["enabled"] == nil { l["enabled"] = false }
+        if l["sources"] == nil { l["sources"] = allSources }
+        if l["exclude"] == nil { l["exclude"] = [String]() }
+        if profiles[l["profile"] as! String] == nil { profiles[l["profile"] as! String] = ["quit": [Any]()] }
+        cfg["profiles"] = profiles
+        lw = l
+        games = pythonJSON(["games", "--json"])
+        running = pythonJSON(["list", "--json"])
+    }
+
+    func save() {
+        guard let d = try? JSONSerialization.data(withJSONObject: cfg, options: [.prettyPrinted, .sortedKeys]) else { return }
+        try? d.write(to: URL(fileURLWithPath: configPath), options: .atomic)
+    }
+
+    func show() {
+        load()
+        if window == nil {
+            let w = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 600, height: 640),
+                             styleMask: [.titled, .closable, .resizable], backing: .buffered, defer: false)
+            w.title = "GameON Preferences"
+            w.isReleasedWhenClosed = false
+            let scroll = NSScrollView()
+            scroll.hasVerticalScroller = true
+            scroll.drawsBackground = false
+            let doc = FlippedView()
+            doc.translatesAutoresizingMaskIntoConstraints = false
+            stack.orientation = .vertical
+            stack.alignment = .leading
+            stack.spacing = 8
+            stack.edgeInsets = NSEdgeInsets(top: 16, left: 16, bottom: 16, right: 16)
+            stack.translatesAutoresizingMaskIntoConstraints = false
+            doc.addSubview(stack)
+            scroll.documentView = doc
+            NSLayoutConstraint.activate([
+                stack.topAnchor.constraint(equalTo: doc.topAnchor), stack.bottomAnchor.constraint(equalTo: doc.bottomAnchor),
+                stack.leadingAnchor.constraint(equalTo: doc.leadingAnchor), stack.trailingAnchor.constraint(equalTo: doc.trailingAnchor),
+                doc.widthAnchor.constraint(equalTo: scroll.contentView.widthAnchor),
+            ])
+            w.contentView = scroll
+            w.center()
+            window = w
+        }
+        rebuild()
+        NSApp.activate(ignoringOtherApps: true)
+        window?.makeKeyAndOrderFront(nil)
+    }
+
+    func act(_ f: @escaping () -> Void) -> Act { let a = Act(f); acts.append(a); return a }
+
+    func label(_ t: String, bold: Bool = false, small: Bool = false) -> NSTextField {
+        let l = NSTextField(wrappingLabelWithString: t)
+        l.font = bold ? .boldSystemFont(ofSize: 13) : .systemFont(ofSize: small ? 11 : 13)
+        if small { l.textColor = .secondaryLabelColor }
+        l.preferredMaxLayoutWidth = 540
+        return l
+    }
+
+    func check(_ title: String, _ on: Bool, _ f: @escaping (Bool) -> Void) -> NSButton {
+        var btn: NSButton!
+        let a = act { f(btn.state == .on) }
+        btn = NSButton(checkboxWithTitle: title, target: a, action: #selector(Act.go))
+        btn.state = on ? .on : .off
+        return btn
+    }
+
+    func popup(_ items: [String], _ selected: String, _ f: @escaping (String) -> Void) -> NSPopUpButton {
+        let p = NSPopUpButton(frame: .zero, pullsDown: false)
+        p.addItems(withTitles: items)
+        p.selectItem(withTitle: selected)
+        let a = act { f(p.titleOfSelectedItem ?? selected) }
+        p.target = a
+        p.action = #selector(Act.go)
+        return p
+    }
+
+    func button(_ title: String, _ f: @escaping () -> Void) -> NSButton {
+        NSButton(title: title, target: act(f), action: #selector(Act.go))
+    }
+
+    func rebuild() {
+        stack.arrangedSubviews.forEach { stack.removeArrangedSubview($0); $0.removeFromSuperview() }
+        acts = []
+
+        stack.addArrangedSubview(label("Auto-detect games", bold: true))
+        stack.addArrangedSubview(check("Free RAM automatically when a game from my library starts", lw["enabled"] as? Bool ?? false) {
+            var l = self.lw; l["enabled"] = $0; self.lw = l; self.save()
+        })
+        stack.addArrangedSubview(label("Needs “Start watching” (menu bar) to be running. Only the apps listed below are touched.", small: true))
+
+        stack.addArrangedSubview(label("Sources", bold: true))
+        let srcRow = NSStackView()
+        srcRow.spacing = 12
+        let enabledSources = lw["sources"] as? [String] ?? allSources
+        for s in allSources {
+            srcRow.addArrangedSubview(check(s, enabledSources.contains(s)) { on in
+                var cur = (self.lw["sources"] as? [String]) ?? allSources
+                cur.removeAll { $0 == s }
+                if on { cur.append(s) }
+                var l = self.lw; l["sources"] = cur; self.lw = l; self.save()
+            })
+        }
+        stack.addArrangedSubview(srcRow)
+
+        stack.addArrangedSubview(label("Apps to free while a game runs", bold: true))
+        stack.addArrangedSubview(label("quit = closes the app politely (frees RAM) · pause = freezes it (no RAM freed) · demote = low priority · keep = leave alone. Voice/meeting/music apps and launchers are protected from pause/demote.", small: true))
+        var list = quitList
+        for (i, e) in list.enumerated() {
+            let row = NSStackView()
+            row.spacing = 8
+            let name = (e["label"] as? String) ?? (e["app"] as? String) ?? "?"
+            let nameLabel = label(name)
+            nameLabel.widthAnchor.constraint(equalToConstant: 200).isActive = true
+            row.addArrangedSubview(nameLabel)
+            row.addArrangedSubview(popup(actionNames, e["action"] as? String ?? "quit") { v in
+                list[i]["action"] = v; self.quitList = list; self.save(); self.rebuild()
+            })
+            if (e["action"] as? String ?? "quit") == "quit" {
+                row.addArrangedSubview(popup(restoreNames, e["restore"] as? String ?? "auto") { v in
+                    list[i]["restore"] = v; self.quitList = list; self.save()
+                })
+            }
+            row.addArrangedSubview(button("Remove") {
+                list.remove(at: i); self.quitList = list; self.save(); self.rebuild()
+            })
+            stack.addArrangedSubview(row)
+        }
+        if list.isEmpty { stack.addArrangedSubview(label("No apps yet: auto-detect will not close anything.", small: true)) }
+
+        let have = Set(list.compactMap { $0["app"] as? String })
+        let addable = running.filter { r in
+            let id = (r["bundle"] as? String) ?? (r["name"] as? String) ?? ""
+            return !have.contains(id) && !id.isEmpty
+        }
+        let add = NSPopUpButton(frame: .zero, pullsDown: true)
+        add.addItem(withTitle: "Add a running app…")
+        for r in addable {
+            let mb = (r["ram_mb"] as? Int) ?? 0
+            add.addItem(withTitle: "\(r["name"] as? String ?? "?")  (~\(mb) MB)")
+        }
+        let addAct = act {
+            let idx = add.indexOfSelectedItem - 1
+            guard idx >= 0, idx < addable.count else { return }
+            let r = addable[idx]
+            list.append(["app": (r["bundle"] as? String) ?? (r["name"] as? String) ?? "", "label": r["name"] as? String ?? "",
+                         "action": "quit", "restore": "auto"])
+            self.quitList = list; self.save(); self.rebuild()
+        }
+        add.target = addAct
+        add.action = #selector(Act.go)
+        stack.addArrangedSubview(add)
+
+        stack.addArrangedSubview(label("Games (uncheck to exclude)", bold: true))
+        let excluded = lw["exclude"] as? [String] ?? []
+        if games.isEmpty { stack.addArrangedSubview(label("No installed games found.", small: true)) }
+        for g in games {
+            guard let id = g["id"] as? String else { continue }
+            let title = "\(g["name"] as? String ?? id)   (\(g["source"] as? String ?? "?"))"
+            stack.addArrangedSubview(check(title, !excluded.contains(id)) { on in
+                var ex = (self.lw["exclude"] as? [String]) ?? []
+                ex.removeAll { $0 == id }
+                if !on { ex.append(id) }
+                var l = self.lw; l["exclude"] = ex; self.lw = l; self.save()
+            })
+        }
+    }
+}
+
+let prefs = Prefs()
+
 final class App: NSObject, NSApplicationDelegate, NSMenuDelegate {
     let item = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
     var timer: Timer?
@@ -70,6 +301,7 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate {
         item.menu = { let m = NSMenu(); m.delegate = self; return m }()
         stopWatching() // stale watch from an earlier run of this app
         refreshIcon()
+        if CommandLine.arguments.contains("--prefs") { prefs.show() } // handy for testing/screenshots
         timer = Timer.scheduledTimer(withTimeInterval: 3, repeats: true) { [weak self] _ in self?.refreshIcon() }
         let c = NSWorkspace.shared.notificationCenter
         for name in [NSWorkspace.didLaunchApplicationNotification, NSWorkspace.didTerminateApplicationNotification] {
@@ -116,6 +348,8 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate {
         add(menu, "Restore apps now", #selector(restoreNow))
         add(menu, "EMERGENCY: Resume all (unpause/undemote)", #selector(resumeAll))
         menu.addItem(.separator())
+        let pi = add(menu, "Preferences…", #selector(openPrefs))
+        pi.keyEquivalent = ","
         add(menu, "Open config", #selector(openConfig))
         add(menu, "Open log", #selector(openLog))
         let l = add(menu, "Start at login", #selector(toggleLogin))
@@ -156,6 +390,7 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate {
         if isWatching() { stopWatching(); DispatchQueue.main.asyncAfter(deadline: .now() + 1) { self.toggleWatch() } }
     }
 
+    @objc func openPrefs() { prefs.show() }
     @objc func restoreNow() { spawnDetached(["restore"]) }
     @objc func resumeAll() { spawnDetached(["resume-all"]) }
     @objc func openConfig() { NSWorkspace.shared.open(URL(fileURLWithPath: home + "/config.json")) }
