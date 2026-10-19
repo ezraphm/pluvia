@@ -54,6 +54,17 @@ func libraryGames() -> [[String: String]] {
 func isWatching() -> Bool { run("/usr/bin/pgrep", ["-f", watchPattern]).0 == 0 }
 func stopWatching() { run("/usr/bin/pkill", ["-TERM", "-f", watchPattern]) }
 
+/// Stopping `watch` during a game session makes it restore your apps right away (it treats SIGTERM like Ctrl+C).
+func confirmStopIfSessionActive(_ what: String) -> Bool {
+    guard isWatching(), let summary = snapshotSummary() else { return true }
+    let a = NSAlert()
+    a.messageText = "A game session is active"
+    a.informativeText = "\(summary).\n\n\(what) will restore your apps immediately, while the game may still be running."
+    a.addButton(withTitle: "Keep watching")
+    a.addButton(withTitle: "Stop and restore apps")
+    return a.runModal() == .alertSecondButtonReturn
+}
+
 func snapshotSummary() -> String? {
     guard let d = FileManager.default.contents(atPath: snapshotPath),
           let j = try? JSONSerialization.jsonObject(with: d) as? [String: Any],
@@ -295,9 +306,10 @@ final class Prefs: NSObject {
         add.action = #selector(Act.go)
         stack.addArrangedSubview(add)
 
-        stack.addArrangedSubview(label("Games (uncheck to exclude)", bold: true))
+        stack.addArrangedSubview(label("Games (uncheck to exclude · text field = launch options, Steam syntax)", bold: true))
         let excluded = lw["exclude"] as? [String] ?? []
         if games.isEmpty { stack.addArrangedSubview(label("No installed games found.", small: true)) }
+        let opts = cfg["launch_options"] as? [String: String] ?? [:]
         for g in games {
             guard let id = g["id"] as? String else { continue }
             let title = "\(g["name"] as? String ?? id)   (\(g["source"] as? String ?? "?"))"
@@ -307,6 +319,22 @@ final class Prefs: NSObject {
                 if !on { ex.append(id) }
                 var l = self.lw; l["exclude"] = ex; self.lw = l; self.save()
             })
+            if g["source"] as? String == "Epic Games" { continue } // launched through the Epic launcher: no options
+            let field = NSTextField(string: opts[id] ?? "")
+            field.placeholderString = (g["steam_options"] as? String).map { "Steam: \($0)" } ?? "Launch options, e.g. FOO=1 %command% -windowed"
+            field.cell?.sendsActionOnEndEditing = true
+            field.widthAnchor.constraint(equalToConstant: 440).isActive = true
+            let a = act {
+                var o = self.cfg["launch_options"] as? [String: String] ?? [:]
+                let v = field.stringValue.trimmingCharacters(in: .whitespaces)
+                if v.isEmpty { o.removeValue(forKey: id) } else { o[id] = v }
+                self.cfg["launch_options"] = o
+                self.save()
+            }
+            field.target = a
+            field.action = #selector(Act.go)
+            let row = NSStackView(views: [NSTextField(labelWithString: "    "), field])
+            stack.addArrangedSubview(row)
         }
     }
 }
@@ -319,7 +347,7 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     func applicationDidFinishLaunching(_ n: Notification) {
         item.menu = { let m = NSMenu(); m.delegate = self; return m }()
-        stopWatching() // stale watch from an earlier run of this app
+        // A running `watch` is adopted, never killed: status comes from pgrep, so restarting this app is harmless.
         refreshIcon()
         if CommandLine.arguments.contains("--prefs") { prefs.show() } // handy for testing/screenshots
         timer = Timer.scheduledTimer(withTimeInterval: 3, repeats: true) { [weak self] _ in self?.refreshIcon() }
@@ -386,7 +414,7 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate {
     }
 
     @objc func toggleWatch() {
-        if isWatching() { stopWatching() }
+        if isWatching() { if confirmStopIfSessionActive("Stopping") { stopWatching() } }
         else { spawnDetached(["watch"] + (UserDefaults.standard.bool(forKey: "dryRun") ? ["--dry-run"] : [])) }
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) { self.refreshIcon() }
     }
@@ -407,7 +435,10 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate {
     @objc func toggleDry() {
         let d = UserDefaults.standard
         d.set(!d.bool(forKey: "dryRun"), forKey: "dryRun")
-        if isWatching() { stopWatching(); DispatchQueue.main.asyncAfter(deadline: .now() + 1) { self.toggleWatch() } }
+        if isWatching() && confirmStopIfSessionActive("Restarting the watcher") {
+            stopWatching()
+            DispatchQueue.main.asyncAfter(deadline: .now() + 1) { self.toggleWatch() }
+        }
     }
 
     @objc func openPrefs() { prefs.show() }
@@ -429,6 +460,7 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate {
     }
 
     @objc func quit() {
+        guard confirmStopIfSessionActive("Quitting") else { return }
         stopWatching()
         NSApp.terminate(nil)
     }

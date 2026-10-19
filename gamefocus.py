@@ -27,6 +27,7 @@ import json
 import os
 import plistlib
 import re
+import shlex
 import signal
 import subprocess
 import sys
@@ -463,6 +464,17 @@ def validate_config(cfg):
             elif e.get("restore", "auto") not in RESTORE_MODES:
                 errs.append("%s.quit[%d] (%s): restore=%r, must be one of %s"
                             % (where, i, e["app"], e["restore"], "/".join(RESTORE_MODES)))
+    lo = cfg.get("launch_options", {})
+    if not isinstance(lo, dict):
+        errs.append("launch_options must be an object: {\"steam:123\": \"FOO=1 %command% -windowed\"}")
+    else:
+        for gid, text in lo.items():
+            try:
+                if not isinstance(text, str):
+                    raise ValueError("must be a string")
+                parse_launch_options(text)
+            except ValueError as e:
+                errs.append("launch_options[%r]: %s" % (gid, e))
     lw = cfg.get("library_watch")
     if lw is not None:
         if not isinstance(lw, dict):
@@ -902,41 +914,135 @@ def library_games():
     return sorted(games, key=lambda g: (g["name"].lower(), g["id"]))
 
 
-def play_game(ident, via_steam, st):
+def parse_launch_options(text):
+    """Steam-style launch options -> (env dict, args list).
+    `FOO=1 BAR=x %command% -windowed`: VAR=value pairs before %command%, arguments after it.
+    Without %command% everything is an argument. Wrappers (e.g. gamemoderun) are not supported."""
+    tokens = shlex.split(text)  # ValueError on unbalanced quotes
+    if "%command%" in tokens:
+        i = tokens.index("%command%")
+        before, args = tokens[:i], tokens[i + 1:]
+    else:
+        before, args = [], tokens
+    env = {}
+    for tok in before:
+        m = re.fullmatch(r"([A-Za-z_][A-Za-z0-9_]*)=(.*)", tok, re.S)
+        if not m:
+            raise ValueError("only VAR=value is allowed before %%command%%, got %r (wrapper commands are not supported)" % tok)
+        env[m.group(1)] = m.group(2)
+    return env, args
+
+
+def vdf_parse(text):
+    """Minimal Valve KeyValues parser: nested dicts of strings."""
+    root = {}
+    stack, key = [root], None
+    for m in re.finditer(r'"((?:[^"\\]|\\.)*)"|([{}])', text):
+        if m.group(2) == "{":
+            new = {}
+            stack[-1][key] = new
+            stack.append(new)
+            key = None
+        elif m.group(2) == "}":
+            if len(stack) > 1:
+                stack.pop()
+        elif key is None:
+            key = m.group(1)
+        else:
+            stack[-1][key] = m.group(1)
+            key = None
+    return root
+
+
+def _ci(d, k):
+    """Case-insensitive dict lookup (Steam's key casing varies)."""
+    return next((v for kk, v in d.items() if kk.lower() == k.lower()), {}) if isinstance(d, dict) else {}
+
+
+def steam_launch_option(appid, root=STEAM_ROOT):
+    """Launch options already set in the Steam client for this game (read from localconfig.vdf, local file only)."""
+    for path in sorted(glob.glob(os.path.join(glob.escape(root), "userdata", "*", "config", "localconfig.vdf"))):
+        try:
+            with open(path, encoding="utf-8", errors="replace") as f:
+                node = vdf_parse(f.read())
+        except OSError:
+            continue
+        for k in ("UserLocalConfigStore", "Software", "Valve", "Steam", "apps", str(appid)):
+            node = _ci(node, k)
+        opt = _ci(node, "LaunchOptions")
+        if isinstance(opt, str) and opt.strip():
+            return opt
+    return ""
+
+
+def norm_game_id(ident):
+    return "steam:" + ident if str(ident).isdigit() else str(ident)
+
+
+def launch_options_for(ident, cfg):
+    """Our config wins (even when empty); otherwise fall back to the options set in the Steam client."""
+    own = cfg.get("launch_options", {})
+    if ident in own:
+        return own[ident]
+    return steam_launch_option(ident.split(":", 1)[1]) if ident.startswith("steam:") else ""
+
+
+def play_game(ident, via_steam, st, options=""):
     """Launch an installed game by id (`steam:<appid>`, `epic:<app>`, `gog:<id>`, `mas:<bundle>`; bare digits = Steam).
-    Steam games: start Steam first if needed, then run the .app directly. Others: .app, else their URI."""
-    ident = "steam:" + ident if str(ident).isdigit() else str(ident)
+    Steam games: start Steam first if needed, then run the .app directly. Others: .app, else their URI.
+    `options` are Steam-style launch options (see parse_launch_options)."""
+    ident = norm_game_id(ident)
     game = next((g for g in library_games() if g["id"] == ident), None)
     if not game:
         return False
+    try:
+        env, args = parse_launch_options(options or "")
+    except ValueError as e:
+        log("invalid launch options for %s, not launching: %s" % (game["name"], e))
+        return False
+    direct = ["open", "-a", game.get("app", "")] + [x for k, v in env.items() for x in ("--env", "%s=%s" % (k, v))] \
+        + (["--args"] + args if args else [])
     if game["source"] == "Steam":
         ensure_steam(st)
         if game.get("app") and not via_steam:
             log("launching %s directly" % game["name"])
-            sh(["open", "-a", game["app"]], timeout=20)
+            sh(direct, timeout=20)
         else:
+            if env:
+                log("environment variables are not supported for steam:// launches, ignoring %s" % ", ".join(env))
             log("launching %s via Steam" % game["name"])
-            sh(["open", "steam://rungameid/%s" % ident.split(":", 1)[1]], timeout=20)
+            url = "steam://rungameid/%s" % ident.split(":", 1)[1]
+            if args:  # Steam's own convention: raw argument string after //
+                url += "//" + urllib.parse.quote(" ".join('"%s"' % a if " " in a else a for a in args))
+            sh(["open", url], timeout=20)
         return True
     if game.get("uri"):
+        if env or args:
+            log("launch options are not supported for %s launches, ignoring them" % game["source"])
         log("launching %s via %s" % (game["name"], game["source"]))
         sh(["open", game["uri"]], timeout=20)
     elif game.get("app"):
         log("launching %s directly" % game["name"])
-        sh(["open", "-a", game["app"]], timeout=20)
+        sh(direct, timeout=20)
     else:
         return False
     return True
 
 
 def cmd_play(args):
-    if not play_game(args.game, args.via_steam, load_config()["settings"]):
-        sys.exit("No launchable installed game '%s' (see `gamefocus.py games`)." % args.game)
+    cfg = load_config()
+    ident = norm_game_id(args.game)
+    if not play_game(ident, args.via_steam, cfg["settings"], launch_options_for(ident, cfg)):
+        sys.exit("Could not launch '%s' (unknown game, or invalid launch options; see `gamefocus.py games` and the log)." % args.game)
 
 
 def cmd_games(args):
     games = library_games()
     if args.json:
+        for g in games:  # lets the UI show what the Steam client would pass
+            opt = steam_launch_option(g["id"].split(":", 1)[1]) if g["source"] == "Steam" else ""
+            if opt:
+                g["steam_options"] = opt
         print(json.dumps(games))
     else:
         for g in games:

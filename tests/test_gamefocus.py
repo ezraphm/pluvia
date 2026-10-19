@@ -393,6 +393,86 @@ class Play(IsolatedHome):
             self.assertFalse(gf.play_game("steam:1", False, dict(ST)))
 
 
+class LaunchOptions(IsolatedHome):
+    def test_steam_syntax_env_before_command_args_after(self):
+        self.assertEqual(gf.parse_launch_options('FOO=1 BAR="a b" %command% -windowed -name "x y"'),
+                         ({"FOO": "1", "BAR": "a b"}, ["-windowed", "-name", "x y"]))
+
+    def test_without_command_placeholder_everything_is_args(self):
+        self.assertEqual(gf.parse_launch_options("-novid -console"), ({}, ["-novid", "-console"]))
+        self.assertEqual(gf.parse_launch_options("  "), ({}, []))
+
+    def test_wrappers_and_bad_names_are_rejected_with_a_clear_error(self):
+        for bad in ("gamemoderun %command%", "1BAD=x %command%", 'unclosed "quote'):
+            with self.assertRaises(ValueError):
+                gf.parse_launch_options(bad)
+
+    def play_cmd(self, game, opts, via_steam=False):
+        calls = []
+        with mock.patch.object(gf, "library_games", return_value=[game]), mock.patch.object(gf, "ensure_steam"), \
+             mock.patch.object(gf, "sh", side_effect=lambda c, timeout=30: calls.append(c) or (0, "", "")):
+            gf.play_game(game["id"], via_steam, dict(ST), opts)
+        return calls
+
+    def test_direct_launch_passes_env_and_args_to_open(self):
+        calls = self.play_cmd({"id": "gog:5", "source": "GOG", "name": "X", "app": "/g/X.app"}, "FOO=1 %command% -w 800")
+        self.assertEqual(calls, [["open", "-a", "/g/X.app", "--env", "FOO=1", "--args", "-w", "800"]])
+
+    def test_steam_url_gets_args_urlencoded_env_is_not_supported(self):
+        game = {"id": "steam:9", "source": "Steam", "name": "G"}
+        calls = self.play_cmd(game, "FOO=1 %command% -name \"a b\"")
+        self.assertEqual(calls, [["open", "steam://rungameid/9//-name%20%22a%20b%22"]])
+
+    def test_epic_uri_ignores_options(self):
+        game = {"id": "epic:a", "source": "Epic Games", "name": "E", "uri": "com.epicgames.launcher://apps/a"}
+        self.assertEqual(self.play_cmd(game, "-x"), [["open", "com.epicgames.launcher://apps/a"]])
+
+    def test_bad_options_do_not_launch_anything(self):
+        game = {"id": "gog:5", "source": "GOG", "name": "X", "app": "/g/X.app"}
+        self.assertEqual(self.play_cmd(game, "gamemoderun %command%"), [])
+
+    def test_config_overrides_steam_local_options(self):
+        cfg = {"launch_options": {"steam:9": "-mine"}}
+        with mock.patch.object(gf, "steam_launch_option", return_value="-theirs"):
+            self.assertEqual(gf.launch_options_for("steam:9", cfg), "-mine")
+            self.assertEqual(gf.launch_options_for("steam:8", cfg), "-theirs")
+            self.assertEqual(gf.launch_options_for("gog:1", cfg), "")
+
+    def test_steam_localconfig_launch_options_are_read(self):
+        vdf = '''"UserLocalConfigStore"
+{
+\t"Software"
+\t{
+\t\t"valve"
+\t\t{
+\t\t\t"Steam"
+\t\t\t{
+\t\t\t\t"apps"
+\t\t\t\t{
+\t\t\t\t\t"108600"
+\t\t\t\t\t{
+\t\t\t\t\t\t"LaunchOptions"\t\t"-Xmx4g %command%"
+\t\t\t\t\t}
+\t\t\t\t}
+\t\t\t}
+\t\t}
+\t}
+}'''
+        with tempfile.TemporaryDirectory() as root:
+            d = os.path.join(root, "userdata", "123", "config")
+            os.makedirs(d)
+            with open(os.path.join(d, "localconfig.vdf"), "w") as f:
+                f.write(vdf)
+            self.assertEqual(gf.steam_launch_option("108600", root), "-Xmx4g %command%")
+            self.assertEqual(gf.steam_launch_option("1", root), "")
+
+    def test_validate_launch_options(self):
+        ok = {"profiles": {}, "launch_options": {"steam:1": "A=1 %command% -x"}}
+        self.assertEqual(gf.validate_config(ok), [])
+        bad = {"profiles": {}, "launch_options": {"steam:1": "gamemoderun %command%", "x": 5}}
+        self.assertEqual(len(gf.validate_config(bad)), 2)
+
+
 class Importers(unittest.TestCase):
     def test_epic_manifests(self):
         with tempfile.TemporaryDirectory() as d:
