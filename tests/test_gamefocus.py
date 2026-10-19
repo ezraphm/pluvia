@@ -199,6 +199,14 @@ class Watch(unittest.TestCase):
             self.assertEqual(gf.watched_hits(cfg), {"a"})
         self.assertEqual(seen, [("steamapps/common/", True)])
 
+    def test_wait_gone_ignores_single_flicker(self):
+        seq = iter([{"g"}, set(), {"g"}, set(), set()])  # one-poll gap must not count as exit
+        calls = []
+        with mock.patch.object(gf, "watched_hits", side_effect=lambda c: calls.append(1) or next(seq)), \
+             mock.patch.object(gf.time, "sleep"):
+            gf.wait_gone({}, "g")
+        self.assertEqual(len(calls), 5)
+
     def test_validate_rejects_watch_without_match(self):
         c = {"profiles": {"w": {"watch": True, "game": {}}}}
         self.assertEqual(len(gf.validate_config(c)), 1)

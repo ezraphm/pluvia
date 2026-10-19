@@ -624,6 +624,14 @@ def watch_tick(counts, hits, need=2):
     return None
 
 
+def wait_gone(cfg, name):
+    """Block until the profile's game is absent for 2 consecutive polls (launchers can flicker)."""
+    gone = 0
+    while gone < 2:
+        time.sleep(3)
+        gone = gone + 1 if name not in watched_hits(cfg) else 0
+
+
 def cmd_watch(args):
     cfg = load_config()
     names = [n for n, p in cfg["profiles"].items() if p.get("watch")]
@@ -640,12 +648,10 @@ def cmd_watch(args):
                 log("game detected for profile '%s'" % fire)
                 if args.dry_run:
                     log("dry-run: would quit apps now. Waiting for the game to exit.")
-                    while fire in watched_hits(cfg):
-                        time.sleep(3)
+                    wait_gone(cfg, fire)
                 elif load_snapshot():
                     log("previous snapshot still pending, not touching apps. Run `restore`.")
-                    while fire in watched_hits(cfg):
-                        time.sleep(3)
+                    wait_gone(cfg, fire)
                 else:
                     prof = cfg["profiles"][fire]
                     targets, _ = select_targets(list_apps(), norm_entries(prof.get("quit", [])), cfg["keep"])
