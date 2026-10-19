@@ -52,6 +52,26 @@ class Calm(unittest.TestCase):
             self.assertIsNone(gf.mem_free_pct())
 
 
+class MemLine(unittest.TestCase):
+    def test_swap_parse_units(self):
+        with mock.patch.object(gf, "sh", return_value=(0, "total = 2048.00M  used = 585.25M  free = 1462.75M  (encrypted)", "")):
+            self.assertEqual(gf.swap_used_mb(), 585)
+        with mock.patch.object(gf, "sh", return_value=(0, "total = 3.00G  used = 1.50G  free = 1.50G", "")):
+            self.assertEqual(gf.swap_used_mb(), 1536)
+        with mock.patch.object(gf, "sh", return_value=(1, "", "x")):
+            self.assertIsNone(gf.swap_used_mb())
+
+    def test_mem_line_shows_measured_values_and_unknowns(self):
+        with mock.patch.object(gf, "mem_free_pct", return_value=27), \
+             mock.patch.object(gf, "swap_used_mb", return_value=585), \
+             mock.patch.object(gf, "mem_pressure", return_value=2):
+            self.assertEqual(gf.mem_line("before"), "memory before: free 27%, swap used 585 MB, pressure 2")
+        with mock.patch.object(gf, "mem_free_pct", return_value=None), \
+             mock.patch.object(gf, "swap_used_mb", return_value=None), \
+             mock.patch.object(gf, "mem_pressure", return_value=1):
+            self.assertEqual(gf.mem_line("x"), "memory x: free ?%, swap used ? MB, pressure 1")
+
+
 class Validate(unittest.TestCase):
     def good(self):
         return {"settings": dict(ST), "keep": [],

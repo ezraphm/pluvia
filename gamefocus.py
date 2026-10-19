@@ -294,6 +294,20 @@ def mem_free_pct():
     return int(m.group(1)) if m else None
 
 
+def swap_used_mb():
+    """Swap in use (MB) from `sysctl vm.swapusage`, or None if unreadable."""
+    rc, out, _ = sh(["sysctl", "-n", "vm.swapusage"])
+    m = re.search(r"used = ([\d.]+)([MG])", out) if rc == 0 else None
+    return round(float(m.group(1)) * (1024 if m.group(2) == "G" else 1)) if m else None
+
+
+def mem_line(label):
+    """One measured (not estimated) memory reading for the log."""
+    free, swap = mem_free_pct(), swap_used_mb()
+    return "memory %s: free %s%%, swap used %s MB, pressure %d" % (
+        label, "?" if free is None else free, "?" if swap is None else swap, mem_pressure())
+
+
 def cpu_idle_pct():
     rc, out, _ = sh(["top", "-l", "2", "-n", "0", "-s", "1"], timeout=25)
     lines = [l for l in out.splitlines() if l.startswith("CPU usage")]
@@ -725,6 +739,7 @@ def run_session(cfg, name, prof, targets, launch=True):
     snap = None
     try:
         if targets:
+            log(mem_line("before"))
             save_snapshot(name, targets)  # BEFORE touching anything
             frozen = [t for t in targets if t["action"] != "quit"]
             quits = [t for t in targets if t["action"] == "quit"]
@@ -736,6 +751,7 @@ def run_session(cfg, name, prof, targets, launch=True):
             snap = {"profile": name, "apps": frozen + done}
             if done:
                 time.sleep(2)
+            log(mem_line("after quit/freeze"))
         log("%d app(s) closed/frozen" % len(snap["apps"]) if snap else "no apps changed")
 
         match, match_args = game.get("match"), game.get("match_args", False)
@@ -762,6 +778,7 @@ def run_session(cfg, name, prof, targets, launch=True):
                     time.sleep(3)
                     gone = gone + 1 if not find_game_pids(match, match_args) else 0
                 log("game exited")
+                log(mem_line("at game exit"))
         else:
             input("No game.match set. Press Enter when you are done playing... ")
     except KeyboardInterrupt:
