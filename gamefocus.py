@@ -987,26 +987,35 @@ def launch_options_for(ident, cfg):
     return steam_launch_option(ident.split(":", 1)[1]) if ident.startswith("steam:") else ""
 
 
-def play_game(ident, via_steam, st, options=""):
+def play_game(ident, via_steam, st, options="", dry=False):
     """Launch an installed game by id (`steam:<appid>`, `epic:<app>`, `gog:<id>`, `mas:<bundle>`; bare digits = Steam).
     Steam games: start Steam first if needed, then run the .app directly. Others: .app, else their URI.
-    `options` are Steam-style launch options (see parse_launch_options)."""
+    `options` are Steam-style launch options (see parse_launch_options). `dry` prints the command instead of running it."""
     ident = norm_game_id(ident)
     game = next((g for g in library_games() if g["id"] == ident), None)
     if not game:
         return False
+    log = (lambda m: print("# " + m)) if dry else globals()["log"]  # a dry run must not touch the log file
     try:
         env, args = parse_launch_options(options or "")
     except ValueError as e:
         log("invalid launch options for %s, not launching: %s" % (game["name"], e))
         return False
+    def run(cmd, timeout=20):
+        if dry:
+            print(" ".join(shlex.quote(x) for x in cmd))
+            return 0, "", ""
+        log("  command: " + " ".join(shlex.quote(x) for x in cmd))  # so the log shows what was really passed
+        return sh(cmd, timeout=timeout)
+
     direct = ["open", "-a", game.get("app", "")] + [x for k, v in env.items() for x in ("--env", "%s=%s" % (k, v))] \
         + (["--args"] + args if args else [])
     if game["source"] == "Steam":
-        ensure_steam(st)
+        if not dry:
+            ensure_steam(st)
         if game.get("app") and not via_steam:
             log("launching %s directly" % game["name"])
-            sh(direct, timeout=20)
+            run(direct)
         else:
             if env:
                 log("environment variables are not supported for steam:// launches, ignoring %s" % ", ".join(env))
@@ -1014,16 +1023,16 @@ def play_game(ident, via_steam, st, options=""):
             url = "steam://rungameid/%s" % ident.split(":", 1)[1]
             if args:  # Steam's own convention: raw argument string after //
                 url += "//" + urllib.parse.quote(" ".join('"%s"' % a if " " in a else a for a in args))
-            sh(["open", url], timeout=20)
+            run(["open", url])
         return True
     if game.get("uri"):
         if env or args:
             log("launch options are not supported for %s launches, ignoring them" % game["source"])
         log("launching %s via %s" % (game["name"], game["source"]))
-        sh(["open", game["uri"]], timeout=20)
+        run(["open", game["uri"]])
     elif game.get("app"):
         log("launching %s directly" % game["name"])
-        sh(direct, timeout=20)
+        run(direct)
     else:
         return False
     return True
@@ -1032,7 +1041,7 @@ def play_game(ident, via_steam, st, options=""):
 def cmd_play(args):
     cfg = load_config()
     ident = norm_game_id(args.game)
-    if not play_game(ident, args.via_steam, cfg["settings"], launch_options_for(ident, cfg)):
+    if not play_game(ident, args.via_steam, cfg["settings"], launch_options_for(ident, cfg), dry=args.dry_run):
         sys.exit("Could not launch '%s' (unknown game, or invalid launch options; see `gamefocus.py games` and the log)." % args.game)
 
 
@@ -1312,6 +1321,7 @@ def main():
     pl = sub.add_parser("play", help="launch an installed game (starts Steam first for Steam games)")
     pl.add_argument("game", help="id from `games` (steam:<appid>, epic:..., gog:..., mas:...); bare digits = Steam")
     pl.add_argument("--via-steam", action="store_true", help="use steam://rungameid instead of the game's .app")
+    pl.add_argument("--dry-run", action="store_true", help="print the launch command, run nothing")
     pl.set_defaults(fn=cmd_play)
     sub.add_parser("resume-all", help="EMERGENCY: undo every pause/demote now").set_defaults(fn=cmd_resume_all)
     sub.add_parser("restore", help="restore apps from last snapshot").set_defaults(fn=cmd_restore)

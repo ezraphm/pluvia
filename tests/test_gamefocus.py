@@ -398,6 +398,22 @@ class LaunchOptions(IsolatedHome):
         self.assertEqual(gf.parse_launch_options('FOO=1 BAR="a b" %command% -windowed -name "x y"'),
                          ({"FOO": "1", "BAR": "a b"}, ["-windowed", "-name", "x y"]))
 
+    def test_zombiebuddy_style_option_keeps_the_double_dash(self):
+        self.assertEqual(gf.parse_launch_options("-javaagent:ZombieBuddy.jar --"), ({}, ["-javaagent:ZombieBuddy.jar", "--"]))
+        calls = self.play_cmd({"id": "steam:108600", "source": "Steam", "name": "PZ", "app": "/p/PZ.app"},
+                              "-javaagent:ZombieBuddy.jar --")
+        self.assertEqual(calls, [["open", "-a", "/p/PZ.app", "--args", "-javaagent:ZombieBuddy.jar", "--"]])
+
+    def test_dry_run_prints_the_command_and_launches_nothing(self):
+        game = {"id": "gog:5", "source": "GOG", "name": "X", "app": "/g/X dir/X.app"}
+        out = []
+        with mock.patch.object(gf, "library_games", return_value=[game]), mock.patch.object(gf, "sh") as sh, \
+             mock.patch("builtins.print", side_effect=lambda *a, **k: out.append(" ".join(map(str, a)))):
+            self.assertTrue(gf.play_game("gog:5", False, dict(ST), "A=1 %command% -x", dry=True))
+        sh.assert_not_called()
+        self.assertEqual(out[-1], "open -a '/g/X dir/X.app' --env A=1 --args -x")
+        self.assertTrue(all(o.startswith(("#", "open")) for o in out))  # nothing else, in particular no log lines
+
     def test_without_command_placeholder_everything_is_args(self):
         self.assertEqual(gf.parse_launch_options("-novid -console"), ({}, ["-novid", "-console"]))
         self.assertEqual(gf.parse_launch_options("  "), ({}, []))

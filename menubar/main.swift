@@ -101,10 +101,11 @@ func pythonJSON(_ args: [String]) -> [[String: Any]] {
     return (try? JSONSerialization.jsonObject(with: data)) as? [[String: Any]] ?? []
 }
 
-final class Prefs: NSObject {
+final class Prefs: NSObject, NSTextFieldDelegate {
     var window: NSWindow?
     let stack = NSStackView()
     var acts: [Act] = []
+    var fieldActs: [ObjectIdentifier: Act] = [:]
     var cfg: [String: Any] = [:]
     var games: [[String: Any]] = []
     var running: [[String: Any]] = []
@@ -184,6 +185,10 @@ final class Prefs: NSObject {
         window?.makeKeyAndOrderFront(nil)
     }
 
+    func controlTextDidChange(_ obj: Notification) {
+        if let f = obj.object as? NSTextField { fieldActs[ObjectIdentifier(f)]?.go() }
+    }
+
     func act(_ f: @escaping () -> Void) -> Act { let a = Act(f); acts.append(a); return a }
 
     func label(_ t: String, bold: Bool = false, small: Bool = false) -> NSTextField {
@@ -219,6 +224,7 @@ final class Prefs: NSObject {
     func rebuild() {
         stack.arrangedSubviews.forEach { stack.removeArrangedSubview($0); $0.removeFromSuperview() }
         acts = []
+        fieldActs = [:]
 
         stack.addArrangedSubview(label("Auto-detect games", bold: true))
         stack.addArrangedSubview(check("Free RAM automatically when a game from my library starts", lw["enabled"] as? Bool ?? false) {
@@ -333,6 +339,8 @@ final class Prefs: NSObject {
             }
             field.target = a
             field.action = #selector(Act.go)
+            field.delegate = self // save on every keystroke too: Enter / focus loss is easy to miss
+            fieldActs[ObjectIdentifier(field)] = a
             let row = NSStackView(views: [NSTextField(labelWithString: "    "), field])
             stack.addArrangedSubview(row)
         }
