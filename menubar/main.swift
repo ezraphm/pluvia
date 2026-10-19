@@ -147,8 +147,38 @@ final class Prefs: NSObject, NSTextFieldDelegate {
         processes = pythonJSON(["list", "--json", "--processes"])
     }
 
+    func readDisk() -> [String: Any]? {
+        guard let d = FileManager.default.contents(atPath: configPath) else { return nil }
+        return (try? JSONSerialization.jsonObject(with: d)) as? [String: Any]
+    }
+
+    /// Never writes a stale in-memory copy over the file: the file is re-read first and only what this window
+    /// owns is replaced (library_watch + the profile's quit list); everything else, launch_options included, stays.
     func save() {
-        guard let d = try? JSONSerialization.data(withJSONObject: cfg, options: [.prettyPrinted, .sortedKeys]) else { return }
+        var disk = readDisk() ?? cfg
+        disk["library_watch"] = cfg["library_watch"]
+        var profiles = disk["profiles"] as? [String: Any] ?? [:]
+        var prof = profiles[profileName] as? [String: Any] ?? [:]
+        prof["quit"] = quitList
+        profiles[profileName] = prof
+        disk["profiles"] = profiles
+        write(disk)
+    }
+
+    /// One launch option changes exactly one key on disk, so other games' options can never be lost.
+    func setLaunchOption(_ id: String, _ value: String) {
+        var disk = readDisk() ?? cfg
+        var o = disk["launch_options"] as? [String: Any] ?? [:]
+        if value.isEmpty { o.removeValue(forKey: id) } else { o[id] = value }
+        disk["launch_options"] = o
+        write(disk)
+        cfg["launch_options"] = o
+    }
+
+    func write(_ obj: [String: Any]) {
+        guard let d = try? JSONSerialization.data(withJSONObject: obj, options: [.prettyPrinted, .sortedKeys]) else { return }
+        try? FileManager.default.removeItem(atPath: configPath + ".bak")
+        try? FileManager.default.copyItem(atPath: configPath, toPath: configPath + ".bak") // last good copy
         try? d.write(to: URL(fileURLWithPath: configPath), options: .atomic)
     }
 
@@ -330,13 +360,7 @@ final class Prefs: NSObject, NSTextFieldDelegate {
             field.placeholderString = (g["steam_options"] as? String).map { "Steam: \($0)" } ?? "Launch options, e.g. FOO=1 %command% -windowed"
             field.cell?.sendsActionOnEndEditing = true
             field.widthAnchor.constraint(equalToConstant: 440).isActive = true
-            let a = act {
-                var o = self.cfg["launch_options"] as? [String: String] ?? [:]
-                let v = field.stringValue.trimmingCharacters(in: .whitespaces)
-                if v.isEmpty { o.removeValue(forKey: id) } else { o[id] = v }
-                self.cfg["launch_options"] = o
-                self.save()
-            }
+            let a = act { self.setLaunchOption(id, field.stringValue.trimmingCharacters(in: .whitespaces)) }
             field.target = a
             field.action = #selector(Act.go)
             field.delegate = self // save on every keystroke too: Enter / focus loss is easy to miss
