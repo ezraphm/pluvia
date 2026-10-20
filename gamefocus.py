@@ -414,11 +414,8 @@ def find_game_pids(match, match_args=False):
 
 
 # ------------------------------------------------------------ config / state
-def validate_config(cfg):
-    """Return a list of human-readable problems (empty = OK)."""
-    errs = []
-    if not isinstance(cfg, dict):
-        return ["config.json must be a JSON object"]
+def _validate_settings(cfg, errs):
+    """Validate cfg["settings"]: type + numeric ranges."""
     st = cfg.get("settings", {})
     if not isinstance(st, dict):
         errs.append("settings must be an object")
@@ -426,70 +423,109 @@ def validate_config(cfg):
     for k, v in st.items():
         if k in DEFAULT_SETTINGS and (isinstance(v, bool) or not isinstance(v, (int, float)) or v < 0):
             errs.append("settings.%s must be a non-negative number, got %r" % (k, v))
+
+
+def _validate_keep(cfg, errs):
     if not isinstance(cfg.get("keep", []), list):
         errs.append("keep must be a list of app names / bundle ids")
+
+
+def _validate_profile(where, prof, errs):
+    """Validate one profile object: game.match regex + watch coupling + quit entries."""
+    if not isinstance(prof, dict):
+        errs.append("%s must be an object" % where)
+        return
+    game = prof.get("game", {})
+    match = game.get("match") if isinstance(game, dict) else None
+    if match is not None:
+        try:
+            re.compile(match)
+        except (re.error, TypeError) as e:
+            errs.append("%s.game.match is not a valid regex: %s" % (where, e))
+    if prof.get("watch") and not match:
+        errs.append("%s: watch=true needs game.match" % where)
+    quit_list = prof.get("quit", [])
+    if not isinstance(quit_list, list):
+        errs.append("%s.quit must be a list" % where)
+        return
+    for i, e in enumerate(quit_list):
+        _validate_quit_entry(where, i, e, errs)
+
+
+def _validate_quit_entry(where, i, e, errs):
+    """Validate one entry inside profiles.<name>.quit (string, process dict, or app dict)."""
+    if isinstance(e, str):
+        return
+    if isinstance(e, dict) and isinstance(e.get("process"), str) and e["process"]:
+        if e.get("action", "quit") not in PROCESS_ACTIONS:
+            errs.append("%s.quit[%d] (process %s): action must be one of %s (processes are never quit)"
+                        % (where, i, e["process"], "/".join(PROCESS_ACTIONS)))
+    elif not isinstance(e, dict) or not isinstance(e.get("app"), str) or not e["app"]:
+        errs.append("%s.quit[%d] needs an \"app\" name or bundle id (or a \"process\" name)" % (where, i))
+    elif e.get("action", "quit") not in ACTIONS:
+        errs.append("%s.quit[%d] (%s): action=%r, must be one of %s"
+                    % (where, i, e["app"], e["action"], "/".join(ACTIONS)))
+    elif e.get("restore", "auto") not in RESTORE_MODES:
+        errs.append("%s.quit[%d] (%s): restore=%r, must be one of %s"
+                    % (where, i, e["app"], e["restore"], "/".join(RESTORE_MODES)))
+
+
+def _validate_profiles(cfg, errs):
+    """Iterate every profile; if profiles itself is not a dict we refuse to go further."""
     profiles = cfg.get("profiles", {})
     if not isinstance(profiles, dict):
-        return errs + ["profiles must be an object"]
+        errs.append("profiles must be an object")
+        return None
     for name, prof in profiles.items():
-        where = "profiles.%s" % name
-        if not isinstance(prof, dict):
-            errs.append("%s must be an object" % where)
-            continue
-        game = prof.get("game", {})
-        match = game.get("match") if isinstance(game, dict) else None
-        if match is not None:
-            try:
-                re.compile(match)
-            except (re.error, TypeError) as e:
-                errs.append("%s.game.match is not a valid regex: %s" % (where, e))
-        if prof.get("watch") and not match:
-            errs.append("%s: watch=true needs game.match" % where)
-        quit_list = prof.get("quit", [])
-        if not isinstance(quit_list, list):
-            errs.append("%s.quit must be a list" % where)
-            continue
-        for i, e in enumerate(quit_list):
-            if isinstance(e, str):
-                continue
-            if isinstance(e, dict) and isinstance(e.get("process"), str) and e["process"]:
-                if e.get("action", "quit") not in PROCESS_ACTIONS:
-                    errs.append("%s.quit[%d] (process %s): action must be one of %s (processes are never quit)"
-                                % (where, i, e["process"], "/".join(PROCESS_ACTIONS)))
-            elif not isinstance(e, dict) or not isinstance(e.get("app"), str) or not e["app"]:
-                errs.append("%s.quit[%d] needs an \"app\" name or bundle id (or a \"process\" name)" % (where, i))
-            elif e.get("action", "quit") not in ACTIONS:
-                errs.append("%s.quit[%d] (%s): action=%r, must be one of %s"
-                            % (where, i, e["app"], e["action"], "/".join(ACTIONS)))
-            elif e.get("restore", "auto") not in RESTORE_MODES:
-                errs.append("%s.quit[%d] (%s): restore=%r, must be one of %s"
-                            % (where, i, e["app"], e["restore"], "/".join(RESTORE_MODES)))
+        _validate_profile("profiles.%s" % name, prof, errs)
+    return profiles
+
+
+def _validate_launch_options(cfg, errs):
     lo = cfg.get("launch_options", {})
     if not isinstance(lo, dict):
         errs.append("launch_options must be an object: {\"steam:123\": \"FOO=1 %command% -windowed\"}")
-    else:
-        for gid, text in lo.items():
-            try:
-                if not isinstance(text, str):
-                    raise ValueError("must be a string")
-                parse_launch_options(text)
-            except ValueError as e:
-                errs.append("launch_options[%r]: %s" % (gid, e))
+        return
+    for gid, text in lo.items():
+        try:
+            if not isinstance(text, str):
+                raise ValueError("must be a string")
+            parse_launch_options(text)
+        except ValueError as e:
+            errs.append("launch_options[%r]: %s" % (gid, e))
+
+
+def _validate_library_watch(cfg, profiles, errs):
     lw = cfg.get("library_watch")
-    if lw is not None:
-        if not isinstance(lw, dict):
-            errs.append("library_watch must be an object")
-        else:
-            if not isinstance(lw.get("enabled", False), bool):
-                errs.append("library_watch.enabled must be true or false")
-            if lw.get("profile") not in profiles:
-                errs.append("library_watch.profile %r is not a profile (available: %s)"
-                            % (lw.get("profile"), ", ".join(profiles) or "none"))
-            bad = [x for x in lw.get("sources", []) if x not in LIBRARY_SOURCES] if isinstance(lw.get("sources", []), list) else None
-            if bad is None or bad:
-                errs.append("library_watch.sources must be a list of: %s" % ", ".join(LIBRARY_SOURCES))
-            if not isinstance(lw.get("exclude", []), list):
-                errs.append("library_watch.exclude must be a list of game ids")
+    if lw is None:
+        return
+    if not isinstance(lw, dict):
+        errs.append("library_watch must be an object")
+        return
+    if not isinstance(lw.get("enabled", False), bool):
+        errs.append("library_watch.enabled must be true or false")
+    if lw.get("profile") not in profiles:
+        errs.append("library_watch.profile %r is not a profile (available: %s)"
+                    % (lw.get("profile"), ", ".join(profiles) or "none"))
+    if not isinstance(lw.get("sources", []), list) or \
+            [x for x in lw.get("sources", []) if x not in LIBRARY_SOURCES]:
+        errs.append("library_watch.sources must be a list of: %s" % ", ".join(LIBRARY_SOURCES))
+    if not isinstance(lw.get("exclude", []), list):
+        errs.append("library_watch.exclude must be a list of game ids")
+
+
+def validate_config(cfg):
+    """Return a list of human-readable problems (empty = OK)."""
+    errs = []
+    if not isinstance(cfg, dict):
+        return ["config.json must be a JSON object"]
+    _validate_settings(cfg, errs)
+    _validate_keep(cfg, errs)
+    profiles = _validate_profiles(cfg, errs)
+    if profiles is None:
+        return errs  # if profiles itself is wrong, skip the rest (matches the original early return)
+    _validate_launch_options(cfg, errs)
+    _validate_library_watch(cfg, profiles, errs)
     return errs
 
 
@@ -1124,68 +1160,88 @@ def cmd_run(args):
     run_session(cfg, args.profile, prof, targets)
 
 
+def _snapshot_and_apply(name, st, targets):
+    """Take the snapshot first, then freeze + quit, then narrow the snapshot to what really changed."""
+    log(mem_line("before"))
+    save_snapshot(name, targets)  # BEFORE touching anything
+    frozen = [t for t in targets if t["action"] != "quit"]
+    quits = [t for t in targets if t["action"] == "quit"]
+    for t in frozen:
+        log("%s %s (%d process(es))" % (t["action"], t["name"], len(t["pids"])))
+        apply_action(t)
+    done = quit_targets(quits, st["quit_timeout"])[0] if quits else []
+    save_snapshot(name, frozen + done)  # only undo what we really changed
+    snap = {"profile": name, "apps": frozen + done}
+    if done:
+        time.sleep(2)
+    log(mem_line("after quit/freeze"))
+    return snap
+
+
+def _launch_game(game, launch):
+    """Start the game by launch_cmd, by .app, or just tell the user to launch it themselves."""
+    if not launch:
+        return
+    if game.get("launch_cmd"):
+        sh(game["launch_cmd"], timeout=20)
+    elif game.get("launch"):
+        sh(["open", "-a", game["launch"]], timeout=20)
+    else:
+        log("start your game now...")
+
+
+def _wait_for_game(st, match, match_args):
+    """Wait for the game process to appear (by regex), then for it to exit again. Block on stdin otherwise."""
+    if match:
+        deadline = time.time() + st["start_timeout"]
+        while not find_game_pids(match, match_args):
+            if time.time() > deadline:
+                log("game process not found within %ss, restoring apps" % st["start_timeout"])
+                break
+            time.sleep(3)
+        else:
+            log("game detected, waiting for it to exit (Ctrl+C = stop waiting and restore)")
+            gone = 0
+            while gone < 2:  # require 2 consecutive misses (launchers can flicker)
+                time.sleep(3)
+                gone = gone + 1 if not find_game_pids(match, match_args) else 0
+            log("game exited")
+            log(mem_line("at game exit"))
+    else:
+        input("No game.match set. Press Enter when you are done playing... ")
+
+
+def _restore_after_game(cfg, st):
+    """Reload the snapshot and restore; honor Ctrl+C during the grace wait."""
+    snap = load_snapshot()
+    if snap:
+        try:
+            time.sleep(st["restore_grace_after_game"])
+        except KeyboardInterrupt:
+            log("grace wait skipped")
+        restore(cfg, snap)
+
+
 def run_session(cfg, name, prof, targets, launch=True):
     """Quit targets, wait for the game, restore. Returns True if interrupted (Ctrl+C/SIGTERM/SIGHUP)."""
     st = cfg["settings"]
     game = prof.get("game", {})
+    match, match_args = game.get("match"), game.get("match_args", False)
     interrupted = False
     _install_signals()
     snap = None
     try:
         if targets:
-            log(mem_line("before"))
-            save_snapshot(name, targets)  # BEFORE touching anything
-            frozen = [t for t in targets if t["action"] != "quit"]
-            quits = [t for t in targets if t["action"] == "quit"]
-            for t in frozen:
-                log("%s %s (%d process(es))" % (t["action"], t["name"], len(t["pids"])))
-                apply_action(t)
-            done = quit_targets(quits, st["quit_timeout"])[0] if quits else []
-            save_snapshot(name, frozen + done)  # only undo what we really changed
-            snap = {"profile": name, "apps": frozen + done}
-            if done:
-                time.sleep(2)
-            log(mem_line("after quit/freeze"))
+            snap = _snapshot_and_apply(name, st, targets)
         log("%d app(s) closed/frozen" % len(snap["apps"]) if snap else "no apps changed")
 
-        match, match_args = game.get("match"), game.get("match_args", False)
-        if not launch:
-            pass
-        elif game.get("launch_cmd"):
-            sh(game["launch_cmd"], timeout=20)
-        elif game.get("launch"):
-            sh(["open", "-a", game["launch"]], timeout=20)
-        else:
-            log("start your game now...")
-
-        if match:
-            deadline = time.time() + st["start_timeout"]
-            while not find_game_pids(match, match_args):
-                if time.time() > deadline:
-                    log("game process not found within %ss, restoring apps" % st["start_timeout"])
-                    break
-                time.sleep(3)
-            else:
-                log("game detected, waiting for it to exit (Ctrl+C = stop waiting and restore)")
-                gone = 0
-                while gone < 2:  # require 2 consecutive misses (launchers can flicker)
-                    time.sleep(3)
-                    gone = gone + 1 if not find_game_pids(match, match_args) else 0
-                log("game exited")
-                log(mem_line("at game exit"))
-        else:
-            input("No game.match set. Press Enter when you are done playing... ")
+        _launch_game(game, launch)
+        _wait_for_game(st, match, match_args)
     except KeyboardInterrupt:
         interrupted = True
         log("interrupted, restoring apps")
     finally:
-        snap = load_snapshot()
-        if snap:
-            try:
-                time.sleep(st["restore_grace_after_game"])
-            except KeyboardInterrupt:
-                log("grace wait skipped")
-            restore(cfg, snap)
+        _restore_after_game(cfg, st)
     return interrupted
 
 
