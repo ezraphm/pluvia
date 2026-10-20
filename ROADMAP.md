@@ -17,13 +17,18 @@ ISPs break it. Python stdlib core (`gamefocus.py`, `steamfix.py`), thin Swift sh
 | T4 | Launcher polish: portrait covers (name over a bottom blur: NSVisualEffectView + CAGradientLayer mask, no Glur/SwiftUI), per-game launch options entry | menubar/launcher.swift | T3 |
 | T5 | steamfix fallback for non-admin accounts (osascript admin prompt) | steamfix.py, tests | - |
 | T6 | README + credits for the Launcher and Steam Fix | README.md | T4 |
-| T7 | Sparkle 2.10 auto-update: framework via swiftc `-F` into `Contents/Frameworks`, rpath, "Check for Updates..." menu item, postpone relaunch while `~/.gamefocus/snapshot.json` exists | menubar/*.swift, build.sh | GitHub repo + EdDSA keys (user), T6 |
+| T7 | Sparkle 2.10 auto-update: framework via swiftc `-F` into `Contents/Frameworks`, rpath, "Check for Updates..." menu item, "What's New" window from CHANGELOG, postpone relaunch while `~/.gamefocus/snapshot.json` exists | menubar/*.swift, build.sh | GitHub repo + EdDSA keys (user), T6 |
 
 ## Needs the user's Mac (not for workers)
 - Steam Fix on a network that really blocks Steam (VN ISP): verify the bypass end to end.
 - RAM measurement before/after quit (log has the lines; no numbers claimed until measured).
 - Restore bug `system still busy after 90s` (PastePal).
 - Epic/GOG detection on real installs (fixture tests only so far).
+
+## Swift shell decision (2026-10-20)
+Stay AppKit + `swiftc`, no SPM/Xcode project, no SwiftUI. Only dependency: Sparkle (T7, framework linked with `-F`).
+Rejected: Glur, SwiftyJSON, SwiftUI-Shimmer, SemanticVersion, WhatsNewKit (all SwiftUI/SPM; RAM cost on 8 GB, overlap
+with Sparkle). "What's New" after an update = small NSWindow showing the CHANGELOG entry (part of T7).
 
 ## Open questions for T7
 - Ad-hoc signing changes the code signature each build: macOS may re-ask the Automation permission after an update (unverified).
