@@ -15,7 +15,7 @@ python3 gamefocus.py status | restore      # pending snapshot / crash recovery
 python3 gamefocus.py games [--json]         # installed games: Steam, Epic, GOG, App Store
 python3 gamefocus.py play <id>              # steam:<appid> | epic:<app> | gog:<id> | mas:<bundle>
 python3 gamefocus.py watch [--dry-run]    # auto-run profiles with "watch": true when their game starts
-python3 gamefocus.py steamfix run [--dns NAME] [--dry-run]  # Steam DNS/proxy fix, foreground, restores on exit
+python3 gamefocus.py steamfix run [--dns NAME] [--dry-run] [--auto-stop]  # Steam DNS/proxy fix, foreground, restores on exit
 python3 gamefocus.py steamfix status [--json]               # applied? server running?
 python3 gamefocus.py steamfix check [--json]                # is Steam blocked/poisoned here? (exit 1 if not ok)
 python3 gamefocus.py steamfix restore                        # undo the DNS/PAC settings
@@ -31,7 +31,10 @@ sets the DNS servers (user-level `networksetup`, no sudo), then serves in the fo
 undoes the settings on exit (Ctrl+C, SIGTERM, SIGHUP, error), and `run`/`watch`/`resume-all` undo a
 session whose server died. `--dns` takes `google`, `cloudflare`, `controld`, `quad9`, `opendns`,
 `adguard`, `nextdns`, `alidns`, `dnssb`, `comodo` or `fastest`; without it the config's
-`steamfix: {"dns": "google"}` applies (default `google`).
+`steamfix: {"dns": "google", "auto": false}` applies (default `google`).
+`steamfix.auto: true` makes `play` start the fix itself for Steam games when no server runs
+(`steamfix run --auto-stop`, detached), and that server stops itself — restoring DNS/proxy — once Steam has
+been closed for 60 s, or 120 s after it started if Steam never appeared.
 
 ## Actions per app
 `quit[].action` = `quit` (default) | `demote` (`taskpolicy -b`: E-cores, low IO) | `pause` (SIGSTOP the app's

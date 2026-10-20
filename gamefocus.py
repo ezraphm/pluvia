@@ -14,6 +14,7 @@ Typical workflow
     python3 gamefocus.py run mygame           # quit apps, play, restore after exit
     python3 gamefocus.py restore              # crash recovery: restore last snapshot
     python3 gamefocus.py steamfix run         # Steam DNS/proxy via steamfix.py (no root), restores on exit
+    python3 gamefocus.py steamfix run --auto-stop  # same, but stops 60s after Steam exits (used by steamfix.auto)
     python3 gamefocus.py steamfix status      # is the fix applied / is a server running
     python3 gamefocus.py steamfix check       # is Steam blocked/poisoned here (read-only, exit 1 if not ok)
     python3 gamefocus.py steamfix restore     # undo the network settings (safe when nothing was applied)
@@ -35,6 +36,7 @@ import shlex
 import signal
 import subprocess
 import sys
+import threading
 import time
 import urllib.parse
 from datetime import datetime
@@ -51,6 +53,11 @@ STEAMFIX_DNS_SETS = ("google", "cloudflare", "controld", "quad9", "opendns", "ad
                      "alidns", "dnssb", "comodo")   # == tuple(steamfix.DNS_SETS)
 STEAMFIX_DNS_NAMES = STEAMFIX_DNS_SETS + ("fastest",)
 STEAMFIX_PROC = "gamefocus[.]py steamfix run"       # pgrep -f pattern for a live steamfix server
+STEAM_PROC = "steam_osx"                            # pgrep -x name of the Steam client's main process
+STEAMFIX_AUTO_STOP_POLL = 5                         # --auto-stop: seconds between Steam checks
+STEAMFIX_AUTO_STOP_GONE = 60                        # --auto-stop: stop this long after Steam exited
+STEAMFIX_AUTO_STOP_START = 120                      # --auto-stop: give up when Steam never appeared by then
+STEAMFIX_AUTO_READY_WAIT = 6                        # play waits this long for the fix to be applied before Steam starts
 
 NEVER_QUIT = set(b.lower() for b in [
     "dev.gameon.menubar",
@@ -527,16 +534,20 @@ def _validate_library_watch(cfg, profiles, errs):
 
 
 def _validate_steamfix(cfg, errs):
-    """Optional top-level `steamfix: {"dns": "google"}`: the DNS set `steamfix run` uses by default."""
+    """Optional top-level `steamfix: {"dns": "google", "auto": false}`: the DNS set `steamfix run` uses by
+    default, and whether `play` starts the fix by itself for Steam games."""
     sfx = cfg.get("steamfix")
     if sfx is None:
         return
     if not isinstance(sfx, dict):
-        errs.append('steamfix must be an object: {"dns": "google"}')
+        errs.append('steamfix must be an object: {"dns": "google", "auto": false}')
         return
     dns = sfx.get("dns")
     if dns is not None and (not isinstance(dns, str) or dns not in STEAMFIX_DNS_NAMES):
         errs.append("steamfix.dns must be one of: %s, got %r" % (", ".join(STEAMFIX_DNS_NAMES), dns))
+    auto = sfx.get("auto")
+    if auto is not None and not isinstance(auto, bool):
+        errs.append("steamfix.auto must be true or false, got %r" % (auto,))
 
 
 def validate_config(cfg):
@@ -792,6 +803,91 @@ def steamfix_watchdog():
     return svc
 
 
+def steam_process_running():
+    """Is the Steam client's main process running? (`pgrep -x steam_osx`, no bundle lookup: works headless.)"""
+    rc, out, _ = sh(["pgrep", "-x", STEAM_PROC])
+    return rc == 0 and bool(out.strip())
+
+
+def _steamfix_auto_enabled(cfg):
+    return bool(((cfg or {}).get("steamfix") or {}).get("auto"))
+
+
+def start_steamfix_auto(cfg, dry=False, logger=None):
+    """`steamfix.auto`: with no server running, start `steamfix run --auto-stop` detached (own session, so it
+    outlives `play` and Ctrl+C in the terminal does not kill it). Returns the command, or None when nothing
+    was started. `--auto-stop` makes that server quit once Steam has gone, restoring the network settings."""
+    logger = logger or log
+    if not _steamfix_auto_enabled(cfg):
+        return None
+    pids = steamfix_running()
+    if pids:
+        logger("steamfix.auto: Steam Fix is already running (pid %s)"
+               % ", ".join(map(str, pids)))
+        return None
+    cmd = [sys.executable, os.path.abspath(__file__), "steamfix", "run", "--auto-stop"]
+    if dry:
+        print(" ".join(shlex.quote(x) for x in cmd))
+        return None
+    logger("steamfix.auto: starting Steam Fix in the background: %s" % " ".join(shlex.quote(x) for x in cmd))
+    try:
+        subprocess.Popen(cmd, start_new_session=True,
+                         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    except OSError as e:  # a missing python/bad path must never stop the game from launching
+        logger("steamfix.auto: could not start Steam Fix: %s" % e)
+        return None
+    # apply_network() takes a second or two: Steam must not log in before the DNS/PAC are in place.
+    deadline = time.monotonic() + STEAMFIX_AUTO_READY_WAIT
+    while not os.path.exists(STEAMFIX_STATE) and time.monotonic() < deadline:
+        time.sleep(0.25)
+    if not os.path.exists(STEAMFIX_STATE):
+        logger("steamfix.auto: Steam Fix not applied after %ss, starting Steam anyway" % STEAMFIX_AUTO_READY_WAIT)
+    return cmd
+
+
+def steamfix_auto_stop(stop, gone_after=STEAMFIX_AUTO_STOP_GONE, start_timeout=STEAMFIX_AUTO_STOP_START,
+                       poll=STEAMFIX_AUTO_STOP_POLL, running=None, now=None, sleep=None, logger=None):
+    """Body of `steamfix run --auto-stop`: call `stop` (steamfix.stop) once Steam is gone.
+
+    Returns "steam-exited" when Steam ran and then stayed closed for `gone_after` seconds, "no-steam" when it
+    never appeared within `start_timeout`. `serve()` returns as soon as `stop` is called, and its `finally`
+    restores the network settings, so the fix never outlives the game. Clock/sleeper/probe are injectable: the
+    tests must not wait for minutes or touch the real process table.
+    """
+    running = running or steam_process_running
+    now = now or time.monotonic
+    sleep = sleep or time.sleep
+    logger = logger or log
+    started = now()
+    seen, gone_since = False, None
+    while True:
+        if running():
+            if not seen:
+                logger("steamfix: Steam is running - auto-stop will stop the fix %ss after it exits" % gone_after)
+                seen = True
+            gone_since = None
+        elif not seen:
+            if now() - started >= start_timeout:
+                logger("steamfix: Steam did not appear within %ss - auto-stop is stopping the fix" % start_timeout)
+                stop()
+                return "no-steam"
+        else:
+            if gone_since is None:
+                gone_since = now()
+            elif now() - gone_since >= gone_after:
+                logger("steamfix: Steam has been closed for %ss - auto-stop is stopping the fix" % gone_after)
+                stop()
+                return "steam-exited"
+        sleep(poll)
+
+
+def _auto_stop_thread(sf):
+    try:
+        steamfix_auto_stop(sf.stop)
+    except Exception as e:  # the watcher is a helper: never let it take the server (and the restore) down
+        log("steamfix: the auto-stop watcher failed: %s" % e)
+
+
 def _watchdogs():
     """Crash recovery at the start of run/watch: undo freezes, then undo a steamfix session whose server died."""
     n = resume_frozen()
@@ -833,6 +929,9 @@ def cmd_steamfix_run(args):
         print("service:     %s" % svc)
         print("dns servers: %s (%s)" % (", ".join(sf.DNS_SETS[dns]), dns))
         print("pac url:     %s" % url)
+        if getattr(args, "auto_stop", False):
+            print("auto-stop:   yes (%ss after Steam exits, or %ss if it never appears)"
+                  % (STEAMFIX_AUTO_STOP_GONE, STEAMFIX_AUTO_STOP_START))
         print("Dry run: nothing changed.")
         return
     if steamfix_running():
@@ -842,6 +941,11 @@ def cmd_steamfix_run(args):
     try:
         log("steamfix: sending Steam through %s on %r (DNS %s)" % (url, svc, dns))
         sf.apply_network(svc, dns, url)
+        if getattr(args, "auto_stop", False):
+            log("steamfix: auto-stop is on - stops %ss after Steam exits, or %ss after start if it never runs"
+                % (STEAMFIX_AUTO_STOP_GONE, STEAMFIX_AUTO_STOP_START))
+            threading.Thread(target=_auto_stop_thread, args=(sf,), daemon=True,
+                             name="steamfix-auto-stop").start()
         sf.serve(dns=dns)
     except KeyboardInterrupt:
         log("interrupted, undoing the network settings")
@@ -1184,9 +1288,10 @@ def launch_options_for(ident, cfg):
     return steam_launch_option(ident.split(":", 1)[1]) if ident.startswith("steam:") else ""
 
 
-def play_game(ident, via_steam, st, options="", dry=False):
+def play_game(ident, via_steam, st, options="", dry=False, cfg=None):
     """Launch an installed game by id (`steam:<appid>`, `epic:<app>`, `gog:<id>`, `mas:<bundle>`; bare digits = Steam).
-    Steam games: start Steam first if needed, then run the .app directly. Others: .app, else their URI.
+    Steam games: start the Steam Fix when `steamfix.auto` is on, start Steam if needed, then run the .app
+    directly. Others: .app, else their URI.
     `options` are Steam-style launch options (see parse_launch_options). `dry` prints the command instead of running it."""
     ident = norm_game_id(ident)
     game = next((g for g in library_games() if g["id"] == ident), None)
@@ -1208,6 +1313,7 @@ def play_game(ident, via_steam, st, options="", dry=False):
     direct = ["open", "-a", game.get("app", "")] + [x for k, v in env.items() for x in ("--env", "%s=%s" % (k, v))] \
         + (["--args"] + args if args else [])
     if game["source"] == "Steam":
+        start_steamfix_auto(cfg or {}, dry=dry, logger=log)  # before Steam starts: its login is what breaks
         if not dry:
             ensure_steam(st)
         if game.get("app") and not via_steam:
@@ -1238,7 +1344,8 @@ def play_game(ident, via_steam, st, options="", dry=False):
 def cmd_play(args):
     cfg = load_config()
     ident = norm_game_id(args.game)
-    if not play_game(ident, args.via_steam, cfg["settings"], launch_options_for(ident, cfg), dry=args.dry_run):
+    if not play_game(ident, args.via_steam, cfg["settings"], launch_options_for(ident, cfg),
+                     dry=args.dry_run, cfg=cfg):
         sys.exit("Could not launch '%s' (unknown game, or invalid launch options; see `gamefocus.py games` and the log)." % args.game)
 
 
@@ -1553,6 +1660,9 @@ def main():
     sfr.add_argument("--dns", help="DNS provider: %s, fastest (default: config steamfix.dns or google)"
                                    % ", ".join(STEAMFIX_DNS_SETS))
     sfr.add_argument("--dry-run", action="store_true", help="print what would be set, change nothing")
+    sfr.add_argument("--auto-stop", action="store_true",
+                     help="stop and restore %ss after Steam exits (or %ss after start if it never runs); "
+                          "used by `play` with steamfix.auto" % (STEAMFIX_AUTO_STOP_GONE, STEAMFIX_AUTO_STOP_START))
     sfr.set_defaults(fn=cmd_steamfix_run)
     sfst = sfs.add_parser("status", help="is the fix applied, and is a server running")
     sfst.add_argument("--json", action="store_true")

@@ -737,6 +737,9 @@ class Steamfix(IsolatedHome):
             p.start()
             self.addCleanup(p.stop)
         self.state = gf.STEAMFIX_STATE
+        p = mock.patch.object(gf, "STEAMFIX_AUTO_READY_WAIT", 0)  # tests never wait for a real apply
+        p.start()
+        self.addCleanup(p.stop)
 
     def write_config(self, **extra):
         cfg = {"settings": dict(ST), "keep": [], "profiles": {}}
@@ -745,7 +748,7 @@ class Steamfix(IsolatedHome):
         with open(gf.CONFIG, "w", encoding="utf-8") as f:
             json.dump(cfg, f)
 
-    def run_cmd(self, dns=None, dry=False, serve=None, apply_side=None, restore_side=None):
+    def run_cmd(self, dns=None, dry=False, serve=None, apply_side=None, restore_side=None, auto_stop=False):
         """Run cmd_steamfix_run with the network side fully mocked; return (calls, printed lines)."""
         calls, out = [], []
         with mock.patch.object(self.sf, "active_service", return_value="Wi-Fi"), \
@@ -757,8 +760,9 @@ class Steamfix(IsolatedHome):
                                side_effect=serve or (lambda **k: calls.append(("serve", k)))), \
              mock.patch.object(self.sf, "restore_network",
                                side_effect=restore_side or (lambda: calls.append(("restore",)))), \
+             mock.patch.object(gf.threading, "Thread"), \
              mock.patch("builtins.print", side_effect=lambda *a, **k: out.append(" ".join(map(str, a)))):
-            gf.cmd_steamfix_run(argparse.Namespace(dns=dns, dry_run=dry))
+            gf.cmd_steamfix_run(argparse.Namespace(dns=dns, dry_run=dry, auto_stop=auto_stop))
         return calls, out
 
     def test_apply_then_serve_then_always_restore(self):
@@ -766,6 +770,25 @@ class Steamfix(IsolatedHome):
         self.assertEqual(calls, [("apply", "Wi-Fi", "cloudflare", "http://127.0.0.1:31627/proxy.pac"),
                                  ("serve", {"dns": "cloudflare"}),
                                  ("restore",)])
+
+    def test_auto_waits_for_the_state_file_before_returning(self):
+        self.write_config(steamfix={"auto": True})
+        with mock.patch.object(gf, "steamfix_running", return_value=[]), \
+             mock.patch.object(gf, "STEAMFIX_AUTO_READY_WAIT", 5), \
+             mock.patch.object(gf.subprocess, "Popen",
+                               side_effect=lambda *a, **k: open(gf.STEAMFIX_STATE, "w").close()), \
+             mock.patch.object(gf.time, "sleep") as sl:
+            self.assertIsNotNone(gf.start_steamfix_auto(gf.load_config(), logger=lambda m: None))
+        sl.assert_not_called()  # state file already there: no polling
+
+    def test_auto_gives_up_waiting_and_still_returns(self):
+        self.write_config(steamfix={"auto": True})
+        msgs = []
+        with mock.patch.object(gf, "steamfix_running", return_value=[]), \
+             mock.patch.object(gf.subprocess, "Popen"), \
+             mock.patch.object(gf.time, "sleep"):
+            self.assertIsNotNone(gf.start_steamfix_auto(gf.load_config(), logger=msgs.append))
+        self.assertTrue(any("starting Steam anyway" in m for m in msgs))
 
     def test_run_refuses_while_another_server_runs(self):
         with mock.patch.object(gf, "steamfix_running", return_value=[4242]):
@@ -947,6 +970,16 @@ class Steamfix(IsolatedHome):
         self.assertEqual(len(gf.validate_config(dict(base, steamfix="google"))), 1)
         self.assertIn("steamfix.dns", gf.validate_config(dict(base, steamfix={"dns": "nope"}))[0])
 
+    def test_validate_steamfix_auto_is_a_bool(self):
+        base = {"profiles": {}}
+        for auto in (True, False):
+            self.assertEqual(gf.validate_config(dict(base, steamfix={"auto": auto})), [])
+        self.assertEqual(gf.validate_config(dict(base, steamfix={"dns": "google", "auto": True})), [])
+        for bad in (1, 0, "true", [], {}):
+            errs = gf.validate_config(dict(base, steamfix={"auto": bad}))
+            self.assertEqual(len(errs), 1, bad)
+            self.assertIn("steamfix.auto", errs[0])
+
     def test_mirrored_constants_match_steamfix(self):
         self.assertEqual(self.steam_state, self.sf.STATE)
         self.assertEqual(set(gf.STEAMFIX_DNS_SETS), set(self.sf.DNS_SETS))
@@ -966,6 +999,190 @@ class Steamfix(IsolatedHome):
              mock.patch.object(gf, "cmd_steamfix_check") as check:
             gf.main()
         self.assertTrue(check.call_args.args[0].json)
+
+    def test_cli_run_accepts_auto_stop(self):
+        with mock.patch.object(sys, "argv", ["gamefocus.py", "steamfix", "run", "--auto-stop"]), \
+             mock.patch.object(gf, "cmd_steamfix_run") as run:
+            gf.main()
+        self.assertTrue(run.call_args.args[0].auto_stop)
+        with mock.patch.object(sys, "argv", ["gamefocus.py", "steamfix", "run"]), \
+             mock.patch.object(gf, "cmd_steamfix_run") as run:
+            gf.main()
+        self.assertFalse(run.call_args.args[0].auto_stop)
+
+    def test_auto_stop_starts_the_watcher_thread_before_serving(self):
+        calls = []
+        with mock.patch.object(self.sf, "active_service", return_value="Wi-Fi"), \
+             mock.patch.object(gf, "steamfix_running", return_value=[]), \
+             mock.patch.object(self.sf, "pac_url", return_value="http://127.0.0.1:31627/proxy.pac"), \
+             mock.patch.object(self.sf, "apply_network", side_effect=lambda *a: calls.append("apply")), \
+             mock.patch.object(self.sf, "serve", side_effect=lambda **k: calls.append("serve")), \
+             mock.patch.object(self.sf, "restore_network", side_effect=lambda: calls.append("restore")), \
+             mock.patch.object(gf.threading, "Thread") as thread, \
+             mock.patch("builtins.print"):
+            gf.cmd_steamfix_run(argparse.Namespace(dns="google", dry_run=False, auto_stop=True))
+        thread.assert_called_once()
+        self.assertEqual(thread.call_args.kwargs.get("target"), gf._auto_stop_thread)
+        self.assertTrue(thread.return_value.start.called)
+        self.assertEqual(calls, ["apply", "serve", "restore"])
+
+    def test_without_auto_stop_no_watcher_thread_runs(self):
+        with mock.patch.object(self.sf, "active_service", return_value="Wi-Fi"), \
+             mock.patch.object(gf, "steamfix_running", return_value=[]), \
+             mock.patch.object(self.sf, "pac_url", return_value="http://127.0.0.1:31627/proxy.pac"), \
+             mock.patch.object(self.sf, "apply_network"), mock.patch.object(self.sf, "serve"), \
+             mock.patch.object(self.sf, "restore_network"), \
+             mock.patch.object(gf.threading, "Thread") as thread, mock.patch("builtins.print"):
+            gf.cmd_steamfix_run(argparse.Namespace(dns="google", dry_run=False, auto_stop=False))
+            gf.cmd_steamfix_run(argparse.Namespace(dns="google", dry_run=False))  # old namespaces keep working
+        thread.assert_not_called()
+
+    def test_watcher_thread_swallows_errors_so_the_restore_still_happens(self):
+        sf = type("FakeSteamfix", (), {"stop": lambda self: None})()
+        with mock.patch.object(gf, "steamfix_auto_stop", side_effect=RuntimeError("pgrep vanished")), \
+             mock.patch.object(gf, "log") as log:
+            self.assertIsNone(gf._auto_stop_thread(sf))
+        self.assertIn("pgrep vanished", log.call_args.args[0])
+
+
+class FakeClock:
+    """Monotonic clock whose sleep() advances time: the auto-stop loop runs in microseconds in tests."""
+
+    def __init__(self, limit=None):
+        self.t = 0.0
+        self.limit = limit
+
+    def now(self):
+        return self.t
+
+    def sleep(self, seconds):
+        self.t += seconds
+        if self.limit is not None and self.t > self.limit:
+            raise AssertionError("auto-stop never stopped (t=%s)" % self.t)
+
+
+class SteamfixAutoStop(IsolatedHome):
+    """`steamfix run --auto-stop`: the server stops itself once Steam is gone, so DNS/proxy never outlive it."""
+
+    def watched(self, running_until, running_again=None, **kw):
+        clock = FakeClock(limit=kw.pop("limit", 1000))
+        stopped = []
+
+        def running():
+            if running_again is not None and clock.t >= running_again:
+                return True
+            return clock.t < running_until
+
+        with mock.patch.object(gf, "log"):
+            reason = gf.steamfix_auto_stop(lambda: stopped.append(clock.t), running=running,
+                                           now=clock.now, sleep=clock.sleep, **kw)
+        return reason, stopped
+
+    def test_stops_60s_after_steam_exits(self):
+        reason, stopped = self.watched(running_until=10)
+        self.assertEqual(reason, "steam-exited")
+        self.assertEqual(stopped, [70])  # 10s of Steam, gone at the first poll, +60s grace
+
+    def test_stops_after_120s_when_steam_never_appears(self):
+        reason, stopped = self.watched(running_until=0)
+        self.assertEqual(reason, "no-steam")
+        self.assertEqual(stopped, [120])
+
+    def test_never_stops_while_steam_keeps_running(self):
+        clock = FakeClock(limit=500)
+        with mock.patch.object(gf, "log"), self.assertRaises(AssertionError):
+            gf.steamfix_auto_stop(lambda: self.fail("stopped while Steam was running"), running=lambda: True,
+                                  now=clock.now, sleep=clock.sleep)
+        self.assertGreater(clock.t, 120)  # it really kept polling past both deadlines
+
+    def test_steam_restarting_resets_the_grace_period(self):
+        clock = FakeClock(limit=1000)
+        stopped = []
+        with mock.patch.object(gf, "log"):
+            gf.steamfix_auto_stop(lambda: stopped.append(clock.t), gone_after=25, start_timeout=999,
+                                  poll=5, now=clock.now, sleep=clock.sleep,
+                                  running=lambda: (clock.t < 10) or (30 <= clock.t < 40))
+        # gone 10..30 (20s, under the grace) -> Steam is back at 30 -> gone again at 40 -> stop at 65
+        self.assertEqual(stopped, [65])
+
+    def test_constants_are_the_documented_ones(self):
+        self.assertEqual(gf.STEAMFIX_AUTO_STOP_GONE, 60)
+        self.assertEqual(gf.STEAMFIX_AUTO_STOP_START, 120)
+        self.assertEqual(gf.STEAM_PROC, "steam_osx")
+
+
+class SteamfixAutoStart(IsolatedHome):
+    """`play` with steamfix.auto: one detached `steamfix run --auto-stop`, and never a real Popen here."""
+
+    CFG = {"steamfix": {"auto": True}}
+
+    def start(self, cfg=None, dry=False, running=(), popen=None):
+        log = mock.Mock()
+        with mock.patch.object(gf, "steamfix_running", return_value=list(running)), \
+             mock.patch.object(gf.subprocess, "Popen", side_effect=popen) as popen_mock:
+            cmd = gf.start_steamfix_auto(self.CFG if cfg is None else cfg, dry=dry, logger=log)
+        return cmd, popen_mock, log
+
+    def test_auto_off_never_starts_anything(self):
+        for cfg in ({}, {"steamfix": {}}, {"steamfix": {"auto": False}}, {"steamfix": {"dns": "google"}}):
+            cmd, popen, _ = self.start(cfg=cfg)
+            self.assertIsNone(cmd)
+            popen.assert_not_called()
+
+    def test_auto_on_starts_a_detached_auto_stop_server(self):
+        cmd, popen, log = self.start()
+        popen.assert_called_once()
+        argv = popen.call_args.args[0]
+        self.assertEqual(argv[1:], [os.path.abspath(gf.__file__), "steamfix", "run", "--auto-stop"])
+        self.assertEqual(argv[0], sys.executable)
+        self.assertTrue(popen.call_args.kwargs["start_new_session"])
+        self.assertEqual(cmd, argv)
+        self.assertIn("starting Steam Fix", log.call_args.args[0])
+
+    def test_existing_server_is_reused_not_duplicated(self):
+        cmd, popen, log = self.start(running=[4242])
+        self.assertIsNone(cmd)
+        popen.assert_not_called()
+        self.assertIn("4242", log.call_args.args[0])
+
+    def test_dry_run_prints_the_command_and_starts_nothing(self):
+        out = []
+        with mock.patch.object(gf, "steamfix_running", return_value=[]), \
+             mock.patch.object(gf.subprocess, "Popen") as popen, \
+             mock.patch("builtins.print", side_effect=lambda *a, **k: out.append(" ".join(map(str, a)))):
+            gf.start_steamfix_auto(self.CFG, dry=True)
+        popen.assert_not_called()
+        self.assertIn("steamfix run --auto-stop", out[-1])
+
+    def test_popen_failure_is_logged_and_swallowed(self):
+        cmd, popen, log = self.start(popen=OSError("no such file"))
+        self.assertIsNone(cmd)
+        self.assertIn("could not start Steam Fix", log.call_args.args[0])
+
+    def test_play_starts_the_fix_before_steam_and_the_game(self):
+        calls = []
+        with mock.patch.object(gf, "library_games", return_value=[dict(GAME)]), \
+             mock.patch.object(gf, "steamfix_running", return_value=[]), \
+             mock.patch.object(gf, "list_apps", return_value=[STEAM_APP]), \
+             mock.patch.object(gf.subprocess, "Popen", side_effect=lambda *a, **k: calls.append("steamfix")), \
+             mock.patch.object(gf, "sh", side_effect=lambda c, timeout=30: calls.append(c) or (0, "", "")):
+            self.assertTrue(gf.play_game("steam:9", False, dict(ST), cfg=self.CFG))
+        self.assertEqual(calls[0], "steamfix")
+        self.assertEqual(calls[-1], ["open", "-a", "/x/G.app"])
+
+    def test_non_steam_games_do_not_start_the_fix(self):
+        gog = {"id": "gog:5", "source": "GOG", "name": "X", "app": "/g/X.app"}
+        with mock.patch.object(gf, "library_games", return_value=[gog]), \
+             mock.patch.object(gf.subprocess, "Popen") as popen, \
+             mock.patch.object(gf, "sh", return_value=(0, "", "")):
+            self.assertTrue(gf.play_game("gog:5", False, dict(ST), cfg=self.CFG))
+        popen.assert_not_called()
+
+    def test_cmd_play_hands_the_config_to_play_game(self):
+        with mock.patch.object(gf, "load_config", return_value=dict(self.CFG, settings=dict(ST), profiles={})), \
+             mock.patch.object(gf, "play_game", return_value=True) as play:
+            gf.cmd_play(argparse.Namespace(game="9", via_steam=False, dry_run=True))
+        self.assertEqual(play.call_args.kwargs["cfg"]["steamfix"], {"auto": True})
 
 
 if __name__ == "__main__":
