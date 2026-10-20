@@ -8,6 +8,24 @@ let steamfixPattern = "\(scriptPath) steamfix run"
 
 func isSteamfixRunning() -> Bool { run("/usr/bin/pgrep", ["-f", steamfixPattern]).0 == 0 }
 
+/// `steamfix check --json` verdict → the one-line note under the switch ("" means no verdict at all).
+func steamCheckText(_ verdict: String) -> String {
+    switch verdict {
+    case "fix_on": return "Steam Fix is on"
+    case "ok": return "Steam reachable"
+    case "dns_poisoned", "dpi_blocked": return "Steam blocked by your network - turn on Steam Fix"
+    default: return "offline"
+    }
+}
+
+func steamCheckVerdict(_ json: String) -> String {
+    guard let d = json.data(using: .utf8),
+          let j = try? JSONSerialization.jsonObject(with: d) as? [String: Any],
+          let v = j["verdict"] as? String else { return "" }
+    // With the fix on, our own DNS change skews the probe: say so instead of "blocked - turn on Steam Fix".
+    return (j["fix_active"] as? Bool) == true ? "fix_on" : v
+}
+
 final class Launcher: NSObject, NSWindowDelegate, NSSearchFieldDelegate {
     var window: NSWindow?
     let statusLabel = NSTextField(labelWithString: "")
@@ -15,6 +33,7 @@ final class Launcher: NSObject, NSWindowDelegate, NSSearchFieldDelegate {
     let watchSwitch = NSSwitch()
     let steamSwitch = NSSwitch()
     let steamNote = NSTextField(labelWithString: "")
+    let steamCheckLabel = NSTextField(labelWithString: "")
     let search = NSSearchField()
     let scroll = NSScrollView()
     let doc = FlippedView()   // scroll document: cards are placed by frame, nested stack views mis-sized them
@@ -23,6 +42,7 @@ final class Launcher: NSObject, NSWindowDelegate, NSSearchFieldDelegate {
     var acts: [Act] = []      // window controls: must outlive every grid rebuild
     var cardActs: [Act] = []  // Play buttons of the current cards only
     var loading = false
+    var steamCheckGen = 0
     var steamStoppedAt: Date?
     var timer: Timer?
 
@@ -32,6 +52,7 @@ final class Launcher: NSObject, NSWindowDelegate, NSSearchFieldDelegate {
         window?.makeKeyAndOrderFront(nil) // isVisible must be true before refreshStatus reads it
         refreshStatus()
         reloadGames()
+        refreshSteamCheck()
         startTimer()
     }
 
@@ -69,6 +90,26 @@ final class Launcher: NSObject, NSWindowDelegate, NSSearchFieldDelegate {
         steamNote.stringValue = restoring ? "restoring..." : ""
     }
 
+    /// Asks `steamfix check --json` whether this network blocks Steam. It resolves DNS and does two TLS
+    /// handshakes, so it runs off the main thread; only the finished verdict touches the label, and a newer
+    /// check always wins over a slower older one.
+    func refreshSteamCheck() {
+        steamCheckGen += 1
+        let gen = steamCheckGen
+        steamCheckLabel.stringValue = "checking…"
+        steamCheckLabel.textColor = .secondaryLabelColor
+        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+            let (_, out) = run(python, [scriptPath, "steamfix", "check", "--json"])
+            let verdict = steamCheckVerdict(out)
+            DispatchQueue.main.async {
+                guard let self = self, gen == self.steamCheckGen else { return }
+                self.steamCheckLabel.stringValue = steamCheckText(verdict)
+                let blocked = verdict == "dns_poisoned" || verdict == "dpi_blocked"
+                self.steamCheckLabel.textColor = blocked ? .systemOrange : .secondaryLabelColor
+            }
+        }
+    }
+
     @objc func toggleWatchClicked() {
         if isWatching() {
             // Never kill `watch` mid-session: it treats SIGTERM like Ctrl+C and restores every app right away.
@@ -93,6 +134,8 @@ final class Launcher: NSObject, NSWindowDelegate, NSSearchFieldDelegate {
             spawnDetached(["steamfix", "run"])
             refreshIn(1.0)
         }
+        // The network change is applied/restored asynchronously, so re-probe once it has settled.
+        DispatchQueue.main.asyncAfter(deadline: .now() + 2.5) { [weak self] in self?.refreshSteamCheck() }
     }
 
     // Same sequence as the menu bar's Play: start `watch` first (if off) so the profile frees RAM when the
@@ -242,6 +285,9 @@ final class Launcher: NSObject, NSWindowDelegate, NSSearchFieldDelegate {
         detailLabel.textColor = .secondaryLabelColor
         steamNote.font = .systemFont(ofSize: 10)
         steamNote.textColor = .secondaryLabelColor
+        steamCheckLabel.font = .systemFont(ofSize: 10)
+        steamCheckLabel.textColor = .secondaryLabelColor
+        steamCheckLabel.preferredMaxLayoutWidth = 320
 
         let status = NSStackView(views: [statusLabel, detailLabel])
         status.orientation = .vertical
@@ -259,7 +305,7 @@ final class Launcher: NSObject, NSWindowDelegate, NSSearchFieldDelegate {
         subtitle.textColor = .secondaryLabelColor
         subtitle.preferredMaxLayoutWidth = 300
 
-        let toggles = NSStackView(views: [watchRow, steamRow, subtitle])
+        let toggles = NSStackView(views: [watchRow, steamRow, steamCheckLabel, subtitle])
         toggles.orientation = .vertical
         toggles.alignment = .leading
         toggles.spacing = 4

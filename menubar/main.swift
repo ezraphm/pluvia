@@ -87,6 +87,9 @@ final class FlippedView: NSView { override var isFlipped: Bool { true } }
 let allSources = ["Steam", "Epic Games", "GOG", "App Store"]
 let actionNames = ["keep", "demote", "pause", "quit"]
 let restoreNames = ["auto", "late", "manual"]
+// Same list as gamefocus.py's STEAMFIX_DNS_NAMES, so a value picked here always validates.
+let steamfixDNSNames = ["google", "cloudflare", "controld", "quad9", "opendns", "adguard", "nextdns",
+                        "alidns", "dnssb", "comodo", "fastest"]
 
 func pythonJSON(_ args: [String]) -> [[String: Any]] {
     let p = Process()
@@ -117,6 +120,13 @@ final class Prefs: NSObject, NSTextFieldDelegate {
         set { cfg["library_watch"] = newValue }
     }
     var profileName: String { lw["profile"] as? String ?? "library" }
+    /// `steamfix: {"dns": "...", "auto": false}`; defaults match gamefocus.py (google, off). An unknown dns
+    /// value falls back to google, so the popup always has a selection to write back.
+    var steamfixDNS: String {
+        let d = (cfg["steamfix"] as? [String: Any])?["dns"] as? String ?? "google"
+        return steamfixDNSNames.contains(d) ? d : "google"
+    }
+    var steamfixAuto: Bool { (cfg["steamfix"] as? [String: Any])?["auto"] as? Bool ?? false }
     var quitList: [[String: Any]] {
         get { ((cfg["profiles"] as? [String: Any])?[profileName] as? [String: Any])?["quit"] as? [[String: Any]] ?? [] }
         set {
@@ -173,6 +183,19 @@ final class Prefs: NSObject, NSTextFieldDelegate {
         disk["launch_options"] = o
         write(disk)
         cfg["launch_options"] = o
+    }
+
+    /// One Steam Fix setting changes exactly one key on disk (`steamfix.dns` / `steamfix.auto`), re-reading the
+    /// file first, so the other key, launch_options and everything else in the config survive a stale window.
+    func setSteamfix(_ key: String, _ value: Any) {
+        var disk = readDisk() ?? cfg
+        var sfx = disk["steamfix"] as? [String: Any] ?? [:]
+        sfx[key] = value
+        disk["steamfix"] = sfx
+        write(disk)
+        var mine = cfg["steamfix"] as? [String: Any] ?? [:]
+        mine[key] = value
+        cfg["steamfix"] = mine
     }
 
     func write(_ obj: [String: Any]) {
@@ -275,6 +298,17 @@ final class Prefs: NSObject, NSTextFieldDelegate {
             })
         }
         stack.addArrangedSubview(srcRow)
+
+        stack.addArrangedSubview(label("Steam Fix", bold: true))
+        stack.addArrangedSubview(label("Sends Steam through a local proxy and a DNS provider your ISP does not poison. “fastest” probes them all and picks the quickest.", small: true))
+        let dnsRow = NSStackView()
+        dnsRow.spacing = 8
+        dnsRow.addArrangedSubview(label("DNS provider"))
+        dnsRow.addArrangedSubview(popup(steamfixDNSNames, steamfixDNS) { self.setSteamfix("dns", $0) })
+        stack.addArrangedSubview(dnsRow)
+        stack.addArrangedSubview(check("Start automatically when I play a Steam game", steamfixAuto) { on in
+            self.setSteamfix("auto", on)
+        })
 
         stack.addArrangedSubview(label("Apps to free while a game runs", bold: true))
         stack.addArrangedSubview(label("quit = closes the app politely (frees RAM) · pause = freezes it (no RAM freed) · demote = low priority · keep = leave alone. Voice/meeting/music apps and launchers are protected from pause/demote.", small: true))
