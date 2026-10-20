@@ -15,6 +15,7 @@ Typical workflow
     python3 gamefocus.py restore              # crash recovery: restore last snapshot
     python3 gamefocus.py steamfix run         # Steam DNS/proxy via steamfix.py (no root), restores on exit
     python3 gamefocus.py steamfix status      # is the fix applied / is a server running
+    python3 gamefocus.py steamfix check       # is Steam blocked/poisoned here (read-only, exit 1 if not ok)
     python3 gamefocus.py steamfix restore     # undo the network settings (safe when nothing was applied)
 
 Safety rules built in
@@ -862,6 +863,30 @@ def cmd_steamfix_status(args):
     print("serving: %s" % ("yes (pid %s)" % ", ".join(map(str, pids)) if pids else "no"))
 
 
+def cmd_steamfix_check(args):
+    """Report whether this network blocks Steam. Read-only: resolves + TLS handshakes, changes nothing.
+
+    Exit code 0 when Steam is reachable, 1 for every problem verdict, so scripts/menubar can use it.
+    """
+    sf = _steamfix()
+    res = sf.check_steam()
+    # Our own DNS change would make the system resolver answer like Google: the verdict is then not the network's.
+    res["fix_active"] = os.path.exists(STEAMFIX_STATE)
+    if res["fix_active"]:
+        res["detail"] += " (Steam Fix is on and changed your DNS: stop it to test the network itself)"
+    if args.json:
+        print(json.dumps(res))
+    else:
+        print("verdict: %s" % res["verdict"])
+        print("system:  %s" % (res["system_ip"] or "-"))
+        print("google:  %s (%s)" % (res["google_ip"] or "-", sf.STEAM_CHECK_DNS))
+        print("detail:  %s" % res["detail"])
+        if res["verdict"] in ("dns_poisoned", "dpi_blocked"):
+            print("Fix: python3 gamefocus.py steamfix run   (Ctrl+C puts the network settings back)")
+    if res["verdict"] != "ok":
+        sys.exit(1)
+
+
 def cmd_steamfix_restore(args):
     sf = _steamfix()
     try:
@@ -1532,6 +1557,9 @@ def main():
     sfst = sfs.add_parser("status", help="is the fix applied, and is a server running")
     sfst.add_argument("--json", action="store_true")
     sfst.set_defaults(fn=cmd_steamfix_status)
+    sfck = sfs.add_parser("check", help="is Steam blocked/poisoned on this network (read-only, exit 1 if not ok)")
+    sfck.add_argument("--json", action="store_true")
+    sfck.set_defaults(fn=cmd_steamfix_check)
     sfs.add_parser("restore", help="undo the DNS/PAC settings (safe if nothing was applied)") \
         .set_defaults(fn=cmd_steamfix_restore)
     args = p.parse_args()

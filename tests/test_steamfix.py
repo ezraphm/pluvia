@@ -349,6 +349,170 @@ class StateFile(unittest.TestCase):
         self.assertEqual(calls[-1][:2], ["networksetup", "-setautoproxyurl"])
         self.assertEqual(self.state()["svc"], "Wi-Fi")
 
+    def test_apply_prompts_for_admin_when_networksetup_is_denied(self):
+        calls = []
+
+        def denied_then_ok(cmd, **kw):
+            calls.append(list(cmd))
+            if cmd[0] == "networksetup":
+                return mock.Mock(returncode=1, stdout="", stderr="Authorization denied")
+            return mock.Mock(returncode=0, stdout="", stderr="")
+
+        with mock.patch.object(sf.subprocess, "run", side_effect=denied_then_ok):
+            st = sf.apply_network("Wi-Fi", "google", PAC)
+        self.assertTrue(st["active"])
+        self.assertEqual([c[0] for c in calls], [
+            "networksetup", "osascript",                       # -setdnsservers
+            "dscacheutil", "killall",                          # flush_dns
+            "networksetup", "osascript",                       # -setautoproxyurl
+            "networksetup", "osascript",                       # -setautoproxystate
+        ])
+        self.assertIn("with administrator privileges", calls[1][2])
+
+
+# ------------------------------------------------- networksetup admin fallback
+
+def reply(returncode=0, stdout="", stderr=""):
+    return mock.Mock(returncode=returncode, stdout=stdout, stderr=stderr)
+
+
+DENIED = reply(1, stderr="Authorization denied: you need admin rights for this change")
+CANCELED = reply(1, stdout="", stderr='execution error: User canceled. (-128)')
+
+
+class Recorder:
+    """subprocess.run stand-in: replays canned replies, records argv, refuses extras."""
+
+    def __init__(self, *replies):
+        self.replies = list(replies)
+        self.calls = []
+
+    def __call__(self, cmd, **kw):
+        assert isinstance(cmd, list), "argv must be a list, got %r" % (cmd,)
+        assert all(isinstance(a, str) for a in cmd), "non-str argv: %r" % (cmd,)
+        assert kw.get("shell") is not True, "shell=True is forbidden"
+        self.calls.append(list(cmd))
+        if not self.replies:
+            raise AssertionError("unexpected extra subprocess.run: %r" % (cmd,))
+        return self.replies.pop(0)
+
+
+class NeedsAdmin(unittest.TestCase):
+    def test_permission_wording_is_recognised_on_any_exit_status(self):
+        for p in [reply(1, stderr="Authorization denied"),
+                  reply(1, stderr="you are not permitted to do that"),
+                  reply(7, stderr="NOT PERMITTED"),
+                  reply(1, stdout="Authorization denied"),
+                  reply(1, stderr="this tool requires administrator privileges")]:
+            with self.subTest(p=(p.returncode, p.stderr, p.stdout)):
+                self.assertTrue(sf._needs_admin(p))
+
+    def test_everything_else_stays_a_plain_failure(self):
+        for p in [reply(0), reply(0, stderr="authorization denied"),   # success is never retried
+                  reply(9, stderr="Invalid parameter"),
+                  reply(1, stderr=""),
+                  reply(1),
+                  reply(2, stderr="requires admin"),                   # only status 1, per contract
+                  reply(1, stderr="Error: The parameters were not valid.")]:
+            with self.subTest(p=(p.returncode, p.stderr)):
+                self.assertFalse(sf._needs_admin(p))
+
+    def test_none_streams_are_harmless(self):
+        self.assertFalse(sf._needs_admin(mock.Mock(returncode=1, stdout=None, stderr=None)))
+
+
+class AppleScriptQuote(unittest.TestCase):
+    def test_plain_argv_becomes_one_shell_line(self):
+        self.assertEqual(
+            sf._applescript_quote(["networksetup", "-setdnsservers", "Wi-Fi", "8.8.8.8"]),
+            "networksetup -setdnsservers Wi-Fi 8.8.8.8")
+
+    def test_a_service_name_with_spaces_is_one_shell_word(self):
+        self.assertEqual(
+            sf._applescript_quote(["networksetup", "-setdnsservers", "USB 10/100/1000 LAN", "8.8.8.8"]),
+            "networksetup -setdnsservers 'USB 10/100/1000 LAN' 8.8.8.8")
+
+    def test_quotes_and_backslashes_are_escaped_after_shell_quoting(self):
+        self.assertEqual(sf._applescript_quote(['x"y']), "'x\\\"y'")
+        self.assertEqual(sf._applescript_quote(["c\\d"]), "'c\\\\d'")
+        # a hostile-looking name stays inside the single quotes AppleScript will pass to sh
+        out = sf._applescript_quote(['Wi"; do shell script "rm -rf /'])
+        self.assertNotIn('"', out.replace('\\"', ""))
+
+    def test_control_characters_are_refused(self):
+        for bad in ["Wi-Fi\n", "Wi-Fi\r", "Wi-Fi\0", "Wi-Fi\t"]:
+            with self.subTest(bad=bad):
+                with self.assertRaises(ValueError):
+                    sf._applescript_quote(["networksetup", "-getdnsservers", bad])
+
+
+class NetworksetupAdminFallback(unittest.TestCase):
+    def patch_run(self, *replies):
+        rec = Recorder(*replies)
+        p = mock.patch.object(sf.subprocess, "run", rec)
+        p.start()
+        self.addCleanup(p.stop)
+        return rec
+
+    def test_success_is_used_as_is_without_a_prompt(self):
+        rec = self.patch_run(reply(0))
+        p = sf._networksetup("-setdnsservers", "Wi-Fi", "1.1.1.1", check=True)
+        self.assertEqual(p.returncode, 0)
+        self.assertEqual(rec.calls, [["networksetup", "-setdnsservers", "Wi-Fi", "1.1.1.1"]])
+
+    def test_permission_error_falls_back_exactly_once(self):
+        rec = self.patch_run(DENIED, reply(0, stdout=""))
+        p = sf._networksetup("-setautoproxystate", "Wi-Fi", "on", check=True)
+        self.assertEqual(p.returncode, 0)
+        self.assertEqual(len(rec.calls), 2)
+        self.assertEqual(rec.calls[1][:2], ["osascript", "-e"])
+        self.assertEqual(rec.calls[1][2], 'do shell script "networksetup -setautoproxystate '
+                                          'Wi-Fi on" with administrator privileges')
+
+    def test_fallback_failure_raises_runtime_error_and_never_loops(self):
+        rec = self.patch_run(DENIED, CANCELED, reply(0))
+        with self.assertRaises(RuntimeError) as ctx:
+            sf._networksetup("-setautoproxystate", "Wi-Fi", "on", check=True)
+        self.assertIn("User canceled", str(ctx.exception))
+        self.assertEqual([c[0] for c in rec.calls], ["networksetup", "osascript"])
+        self.assertEqual(len(rec.replies), 1)                      # the spare reply is untouched
+
+    def test_non_permission_failure_raises_without_a_prompt(self):
+        rec = self.patch_run(reply(9, stderr="Invalid parameter"))
+        with self.assertRaises(RuntimeError):
+            sf._networksetup("-setdnsservers", "Wi-Fi", "bogus", check=True)
+        self.assertEqual([c[0] for c in rec.calls], ["networksetup"])
+
+    def test_service_name_with_spaces_is_quoted_inside_the_prompt(self):
+        rec = self.patch_run(reply(1, stderr="not permitted"), reply(0))
+        sf._networksetup("-setdnsservers", "USB 10/100/1000 LAN", "8.8.8.8", check=True)
+        script = rec.calls[1][2]
+        self.assertTrue(script.startswith('do shell script "'))
+        self.assertTrue(script.endswith('" with administrator privileges'))
+        self.assertIn("'USB 10/100/1000 LAN'", script)
+        self.assertEqual(script, 'do shell script "networksetup -setdnsservers '
+                                 "'USB 10/100/1000 LAN' 8.8.8.8\" with administrator privileges")
+
+    def test_admin_prompt_that_cannot_start_reports_the_original_failure(self):
+        calls = []
+
+        def run(cmd, **kw):
+            calls.append(list(cmd))
+            if cmd[0] == "osascript":
+                raise OSError("osascript missing")
+            return DENIED
+
+        with mock.patch.object(sf.subprocess, "run", side_effect=run):
+            with self.assertRaises(RuntimeError) as ctx:
+                sf._networksetup("-setautoproxystate", "Wi-Fi", "on", check=True)
+        self.assertIn("Authorization denied", str(ctx.exception))
+        self.assertEqual([c[0] for c in calls], ["networksetup", "osascript"])
+
+    def test_check_false_keeps_the_result_instead_of_raising(self):
+        self.patch_run(DENIED, CANCELED)
+        p = sf._networksetup("-setautoproxystate", "Wi-Fi", "on")
+        self.assertEqual(p.returncode, 1)
+
 
 # ------------------------------------------------------------------------- status
 
@@ -537,6 +701,152 @@ class Resolve(unittest.TestCase):
             sf.resolve("cdn.example")
         sf.demote_ip("cdn.example", "1.1.1.1")
         self.assertEqual(sf.resolve("cdn.example"), ["1.1.1.1"])
+
+
+# ------------------------------------------------------------ reachability check
+
+class CheckSteam(unittest.TestCase):
+    """Every network call is mocked: no DNS query and no TLS connection leaves this machine."""
+
+    def run_check(self, system=None, google=None, tls=True):
+        """system/google: a return value or an exception instance; tls: bool or a side_effect callable."""
+        def patch(name, value):
+            spec = {"side_effect": value} if isinstance(value, Exception) else {"return_value": value}
+            return mock.patch.object(sf, name, **spec)
+
+        tls_mock = mock.Mock(return_value=tls) if isinstance(tls, bool) else mock.Mock(side_effect=tls)
+        with patch("system_resolve", system), patch("google_resolve", google), \
+             mock.patch.object(sf, "tls_handshake", tls_mock):
+            res = sf.check_steam()
+        self.tls = tls_mock
+        return res
+
+    def test_ok_when_the_system_address_completes_tls(self):
+        res = self.run_check(system=["203.0.113.5"], google=["198.51.100.7"], tls=True)
+        self.assertEqual(res["verdict"], "ok")
+        self.assertEqual(res["system_ip"], "203.0.113.5")
+        self.assertEqual(res["google_ip"], "198.51.100.7")
+        self.assertIn("203.0.113.5", res["detail"])
+        self.tls.assert_called_once_with("203.0.113.5", sf.STEAM_CHECK_HOST, sf.CHECK_TIMEOUT)
+
+    def test_ok_when_system_and_google_agree(self):
+        res = self.run_check(system=["203.0.113.5"], google=["203.0.113.5"], tls=True)
+        self.assertEqual(res["verdict"], "ok")
+        self.assertEqual(res["system_ip"], res["google_ip"])
+
+    def test_dns_poisoned_when_system_ip_differs_and_fails_while_google_works(self):
+        res = self.run_check(system=["10.0.0.1"], google=["203.0.113.5"],
+                             tls=lambda ip, *a, **k: ip == "203.0.113.5")
+        self.assertEqual(res["verdict"], "dns_poisoned")
+        self.assertEqual(res["system_ip"], "10.0.0.1")
+        self.assertEqual(res["google_ip"], "203.0.113.5")
+        self.assertIn("10.0.0.1", res["detail"])
+        self.assertEqual([c.args[0] for c in self.tls.call_args_list], ["10.0.0.1", "203.0.113.5"])
+
+    def test_dns_poisoned_when_the_system_resolver_returns_nothing(self):
+        res = self.run_check(system=OSError("no answer"), google=["203.0.113.5"], tls=True)
+        self.assertEqual(res["verdict"], "dns_poisoned")
+        self.assertIsNone(res["system_ip"])
+        self.assertEqual(res["google_ip"], "203.0.113.5")
+        self.assertIn("returned nothing", res["detail"])
+
+    def test_dpi_blocked_when_both_handshakes_fail(self):
+        res = self.run_check(system=["203.0.113.5"], google=["198.51.100.7"], tls=False)
+        self.assertEqual(res["verdict"], "dpi_blocked")
+        self.assertEqual(res["system_ip"], "203.0.113.5")
+        self.assertEqual(res["google_ip"], "198.51.100.7")
+        self.assertEqual(self.tls.call_count, 2)
+        self.assertIn("203.0.113.5", res["detail"])
+
+    def test_dpi_blocked_without_a_system_address(self):
+        res = self.run_check(system=OSError("boom"), google=["198.51.100.7"], tls=False)
+        self.assertEqual(res["verdict"], "dpi_blocked")
+        self.assertIsNone(res["system_ip"])
+        self.assertIn("none resolved", res["detail"])
+
+    def test_offline_when_nothing_resolves(self):
+        res = self.run_check(system=OSError("offline"), google=OSError("timeout"), tls=True)
+        self.assertEqual(res["verdict"], "offline")
+        self.assertIsNone(res["system_ip"])
+        self.assertIsNone(res["google_ip"])
+        self.tls.assert_not_called()
+
+    def test_offline_when_both_resolvers_return_an_empty_list(self):
+        self.assertEqual(self.run_check(system=[], google=[])["verdict"], "offline")
+
+    def test_same_ip_that_works_on_the_retry_is_ok_not_poisoned(self):
+        attempts = []
+
+        def tls(ip, *a, **k):
+            attempts.append(ip)
+            return len(attempts) > 1        # first attempt dropped, second one handshakes
+
+        res = self.run_check(system=["203.0.113.5"], google=["203.0.113.5"], tls=tls)
+        self.assertEqual(res["verdict"], "ok")
+        self.assertEqual(attempts, ["203.0.113.5", "203.0.113.5"])
+
+    def test_result_shape_has_exactly_the_four_json_keys(self):
+        res = self.run_check(system=["203.0.113.5"], google=["203.0.113.5"], tls=True)
+        self.assertEqual(set(res), {"verdict", "system_ip", "google_ip", "detail"})
+        self.assertIn(res["verdict"], sf.VERDICTS)
+        json.dumps(res)  # must be printable by --json as-is
+
+    def test_check_passes_the_timeout_to_the_dns_query_and_the_handshake(self):
+        with mock.patch.object(sf, "system_resolve", return_value=["203.0.113.5"]) as sysr, \
+             mock.patch.object(sf, "google_resolve", return_value=["198.51.100.7"]) as goog, \
+             mock.patch.object(sf, "tls_handshake", return_value=True):
+            sf.check_steam(timeout=7)
+        sysr.assert_called_once_with(sf.STEAM_CHECK_HOST)
+        goog.assert_called_once_with(sf.STEAM_CHECK_HOST, 7)
+        self.assertEqual(sf.CHECK_TIMEOUT, 4)
+
+
+class CheckNetworkHelpers(unittest.TestCase):
+    def test_google_resolve_asks_8888_with_plain_dns(self):
+        self.assertEqual(sf.STEAM_CHECK_DNS, "8.8.8.8")
+        self.assertEqual(sf.STEAM_CHECK_DNS, sf.DNS_SETS["google"][0])
+        with mock.patch.object(sf, "dns_query", return_value=["203.0.113.5"]) as q:
+            self.assertEqual(sf.google_resolve("store.example", 4), ["203.0.113.5"])
+        q.assert_called_once_with("store.example", "8.8.8.8", 4)
+
+    def test_system_resolve_uses_getaddrinfo_ipv4_and_dedupes(self):
+        infos = [(2, 1, 6, "", ("203.0.113.5", 443)), (2, 1, 6, "", ("203.0.113.5", 443)),
+                 (2, 1, 6, "", ("198.51.100.7", 443))]
+        with mock.patch.object(sf.socket, "getaddrinfo", return_value=infos) as gai:
+            self.assertEqual(sf.system_resolve(), ["203.0.113.5", "198.51.100.7"])
+        gai.assert_called_once_with(sf.STEAM_CHECK_HOST, 443, sf.socket.AF_INET)
+
+    def test_system_resolve_propagates_failure(self):
+        with mock.patch.object(sf.socket, "getaddrinfo", side_effect=OSError("no dns")):
+            with self.assertRaises(OSError):
+                sf.system_resolve()
+
+    def test_tls_handshake_is_false_when_the_connect_fails(self):
+        for exc in (OSError("refused"), sf.socket.timeout("timed out")):
+            with self.subTest(exc=exc), \
+                 mock.patch.object(sf.socket, "create_connection", side_effect=exc):
+                self.assertFalse(sf.tls_handshake("203.0.113.5"))
+
+    def test_tls_handshake_is_false_when_the_handshake_fails(self):
+        class Ctx:
+            def wrap_socket(self, raw, server_hostname=None):
+                raise sf.ssl.SSLError("handshake blocked")
+        with mock.patch.object(sf.socket, "create_connection", return_value=mock.MagicMock()), \
+             mock.patch.object(sf.ssl, "SSLContext", return_value=Ctx()):
+            self.assertFalse(sf.tls_handshake("203.0.113.5"))
+
+    def test_tls_handshake_sends_sni_with_a_4s_budget_and_ignores_the_certificate(self):
+        ctx = mock.MagicMock()
+        with mock.patch.object(sf.socket, "create_connection", return_value=mock.MagicMock()) as conn, \
+             mock.patch.object(sf.ssl, "SSLContext", return_value=ctx):
+            self.assertTrue(sf.tls_handshake("203.0.113.5"))
+        conn.assert_called_once_with(("203.0.113.5", 443), timeout=4)
+        ctx.wrap_socket.assert_called_once_with(mock.ANY, server_hostname=sf.STEAM_CHECK_HOST)
+        self.assertEqual(ctx.verify_mode, sf.ssl.CERT_NONE)
+        self.assertFalse(ctx.check_hostname)
+
+    def test_tls_handshake_returns_false_for_an_invalid_ip(self):
+        self.assertFalse(sf.tls_handshake("not-an-ip"))
 
 
 # -------------------------------------------------------------------------- proxy

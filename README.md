@@ -17,6 +17,7 @@ python3 gamefocus.py play <id>              # steam:<appid> | epic:<app> | gog:<
 python3 gamefocus.py watch [--dry-run]    # auto-run profiles with "watch": true when their game starts
 python3 gamefocus.py steamfix run [--dns NAME] [--dry-run]  # Steam DNS/proxy fix, foreground, restores on exit
 python3 gamefocus.py steamfix status [--json]               # applied? server running?
+python3 gamefocus.py steamfix check [--json]                # is Steam blocked/poisoned here? (exit 1 if not ok)
 python3 gamefocus.py steamfix restore                        # undo the DNS/PAC settings
 python3 -m unittest discover -s tests
 ```

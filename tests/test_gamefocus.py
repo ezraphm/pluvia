@@ -749,6 +749,7 @@ class Steamfix(IsolatedHome):
         """Run cmd_steamfix_run with the network side fully mocked; return (calls, printed lines)."""
         calls, out = [], []
         with mock.patch.object(self.sf, "active_service", return_value="Wi-Fi"), \
+             mock.patch.object(gf, "steamfix_running", return_value=[]), \
              mock.patch.object(self.sf, "pac_url", return_value="http://127.0.0.1:31627/proxy.pac"), \
              mock.patch.object(self.sf, "apply_network",
                                side_effect=apply_side or (lambda *a: calls.append(("apply",) + a))), \
@@ -774,6 +775,7 @@ class Steamfix(IsolatedHome):
     def test_restore_runs_even_when_serve_raises(self):
         restored = []
         with mock.patch.object(self.sf, "active_service", return_value="Wi-Fi"), \
+             mock.patch.object(gf, "steamfix_running", return_value=[]), \
              mock.patch.object(self.sf, "pac_url", return_value="http://127.0.0.1:31627/proxy.pac"), \
              mock.patch.object(self.sf, "apply_network") as apply_n, \
              mock.patch.object(self.sf, "serve", side_effect=RuntimeError("proxy died")), \
@@ -809,6 +811,7 @@ class Steamfix(IsolatedHome):
         calls = []
         with mock.patch.object(self.sf, "fastest_dns", return_value=("quad9", [(1.0, "quad9")])), \
              mock.patch.object(self.sf, "active_service", return_value="Wi-Fi"), \
+             mock.patch.object(gf, "steamfix_running", return_value=[]), \
              mock.patch.object(self.sf, "pac_url", return_value="http://127.0.0.1:31627/proxy.pac"), \
              mock.patch.object(self.sf, "apply_network", side_effect=lambda *a: calls.append(a)), \
              mock.patch.object(self.sf, "serve"), mock.patch.object(self.sf, "restore_network"), \
@@ -879,6 +882,54 @@ class Steamfix(IsolatedHome):
         restore.assert_called_once()
         self.assertIn("Nothing to restore", out[-1])
 
+    def test_check_json_prints_the_verdict_and_exits_zero_when_ok(self):
+        res = {"verdict": "ok", "system_ip": "203.0.113.5", "google_ip": "203.0.113.5", "detail": "fine"}
+        out = []
+        with mock.patch.object(self.sf, "check_steam", return_value=dict(res)), \
+             mock.patch("builtins.print", side_effect=lambda *a, **k: out.append(" ".join(map(str, a)))):
+            self.assertIsNone(gf.cmd_steamfix_check(argparse.Namespace(json=True)))
+        self.assertEqual(json.loads(out[-1]), dict(res, fix_active=False))
+
+    def test_check_flags_an_active_fix_because_its_dns_skews_the_verdict(self):
+        open(gf.STEAMFIX_STATE, "w").close()
+        res = {"verdict": "dpi_blocked", "system_ip": "1.2.3.4", "google_ip": "1.2.3.4", "detail": "x"}
+        out = []
+        with mock.patch.object(self.sf, "check_steam", return_value=dict(res)), \
+             mock.patch("builtins.print", side_effect=lambda *a, **k: out.append(" ".join(map(str, a)))):
+            with self.assertRaises(SystemExit):
+                gf.cmd_steamfix_check(argparse.Namespace(json=True))
+        got = json.loads(out[-1])
+        self.assertTrue(got["fix_active"])
+        self.assertIn("Steam Fix is on", got["detail"])
+
+    def test_check_exits_one_for_every_problem_verdict(self):
+        for verdict in ("dns_poisoned", "dpi_blocked", "offline"):
+            with self.subTest(verdict=verdict):
+                res = {"verdict": verdict, "system_ip": "10.0.0.1", "google_ip": "203.0.113.5",
+                       "detail": "%s because" % verdict}
+                out = []
+                with mock.patch.object(self.sf, "check_steam", return_value=dict(res)), \
+                     mock.patch("builtins.print", side_effect=lambda *a, **k: out.append(" ".join(map(str, a)))):
+                    with self.assertRaises(SystemExit) as cm:
+                        gf.cmd_steamfix_check(argparse.Namespace(json=False))
+                self.assertEqual(cm.exception.code, 1)
+                text = "\n".join(out)
+                self.assertIn("verdict: %s" % verdict, text)
+                self.assertIn("10.0.0.1", text)
+                self.assertIn("203.0.113.5 (8.8.8.8)", text)
+                self.assertEqual("steamfix run" in text, verdict != "offline")  # no fix hint when offline
+
+    def test_check_never_touches_the_network_settings(self):
+        res = {"verdict": "ok", "system_ip": "203.0.113.5", "google_ip": "203.0.113.5", "detail": "fine"}
+        with mock.patch.object(self.sf, "check_steam", return_value=dict(res)), \
+             mock.patch.object(self.sf, "apply_network") as apply_n, \
+             mock.patch.object(self.sf, "restore_network") as restore_n, \
+             mock.patch.object(self.sf, "serve") as serve, mock.patch("builtins.print"):
+            gf.cmd_steamfix_check(argparse.Namespace(json=True))
+        apply_n.assert_not_called()
+        restore_n.assert_not_called()
+        serve.assert_not_called()
+
     def test_resume_all_runs_the_steamfix_watchdog(self):
         with mock.patch.object(gf, "resume_frozen", return_value=0), \
              mock.patch.object(gf, "steamfix_watchdog") as wd, \
@@ -902,13 +953,19 @@ class Steamfix(IsolatedHome):
 
     def test_cli_parses_the_steamfix_subcommands(self):
         for argv in (["steamfix", "run", "--dry-run"], ["steamfix", "run", "--dns", "quad9"],
-                     ["steamfix", "status", "--json"], ["steamfix", "restore"]):
+                     ["steamfix", "status", "--json"], ["steamfix", "restore"],
+                     ["steamfix", "check", "--json"], ["steamfix", "check"]):
             with mock.patch.object(sys, "argv", ["gamefocus.py"] + argv), \
                  mock.patch.object(gf, "cmd_steamfix_run") as run, \
                  mock.patch.object(gf, "cmd_steamfix_status") as status, \
+                 mock.patch.object(gf, "cmd_steamfix_check") as check, \
                  mock.patch.object(gf, "cmd_steamfix_restore") as restore:
                 gf.main()
-            self.assertEqual(run.call_count + status.call_count + restore.call_count, 1)
+            self.assertEqual(run.call_count + status.call_count + restore.call_count + check.call_count, 1)
+        with mock.patch.object(sys, "argv", ["gamefocus.py", "steamfix", "check", "--json"]), \
+             mock.patch.object(gf, "cmd_steamfix_check") as check:
+            gf.main()
+        self.assertTrue(check.call_args.args[0].json)
 
 
 if __name__ == "__main__":

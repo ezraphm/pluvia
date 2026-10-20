@@ -11,7 +11,9 @@ Two independent halves, deliberately kept apart:
     * Privileged network config (later run inside a root daemon): ``apply_network()``
       and ``restore_network()``. These only call ``networksetup`` with a validated
       argument list - never a shell - and save/restore the previous state in
-      ``/var/tmp/saf-state.json``.
+      ``/var/tmp/saf-state.json``. On a non-admin account a permissions failure is
+      retried once through ``osascript ... with administrator privileges``; every
+      argv item is shell-quoted inside that one AppleScript line.
 
 Importing this module has no side effects: it starts nothing, reads no argv,
 and touches no system settings. Standard library only.
@@ -26,7 +28,9 @@ import json
 import os
 import random
 import re
+import shlex
 import socket
+import ssl
 import struct
 import subprocess
 import time
@@ -69,12 +73,62 @@ def sh(*args, timeout=20):
     return p.stdout or ""
 
 
+_ADMIN_SCRIPT = 'do shell script "%s" with administrator privileges'
+
+
+def _needs_admin(p):
+    """True when a failed networksetup call is a permissions problem, not a bad argument.
+
+    networksetup tells a normal user either "Authorization denied" / "not permitted"
+    (any status), or asks for admin rights with exit status 1 ("requires admin ...").
+    Anything else - unknown service, invalid parameter - must never pop a password box.
+    """
+    if p.returncode == 0:
+        return False
+    err = ("%s\n%s" % (p.stderr or "", p.stdout or "")).lower()
+    if "authoriz" in err or "not permitted" in err:
+        return True
+    return p.returncode == 1 and "requires admin" in err
+
+
+def _applescript_quote(argv):
+    """The shell-command body of one `do shell script`: argv shell-quoted, then AppleScript-escaped.
+
+    ``argv`` is already validated (``network_services()``, ``_check_dns_name()``, IP
+    literals), and shlex.quote makes each item a single shell word, so a service name
+    with spaces stays one argument. AppleScript's double-quoted string only knows
+    ``\\\\`` and ``\\"``, so those two are escaped last, after quoting.
+    """
+    items = [str(a) for a in argv]
+    for a in items:
+        if any(ord(c) < 0x20 or ord(c) == 0x7F for c in a):
+            raise ValueError("refusing to build an AppleScript line from a control character")
+    line = " ".join(shlex.quote(a) for a in items)
+    return line.replace("\\", "\\\\").replace('"', '\\"')
+
+
+def _run_as_admin(argv, timeout=30):
+    """One admin-prompt attempt at argv (already a validated list). Never shell=True."""
+    script = _ADMIN_SCRIPT % _applescript_quote(argv)
+    return subprocess.run(["osascript", "-e", script], capture_output=True, text=True, timeout=timeout)
+
+
 def _networksetup(*args, check=False, timeout=30):
-    """Run networksetup with already-validated argv. Never shell=True."""
+    """Run networksetup with already-validated argv. Never shell=True.
+
+    A permissions failure (typically: GameON.app running as a non-admin user) is
+    retried ONCE through the osascript admin prompt - no loop, so a declined prompt
+    or a missing osascript costs one extra call and then reports the failure.
+    """
     cmd = ["networksetup"] + [str(a) for a in args]
     p = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+    if _needs_admin(p):
+        try:
+            p = _run_as_admin(cmd, timeout=timeout)
+        except (OSError, subprocess.TimeoutExpired):
+            pass                      # keep the unprivileged result: check=True reports it
     if check and p.returncode != 0:
-        raise RuntimeError("networksetup %s failed: %s" % (args[0], (p.stderr or p.stdout).strip()))
+        raise RuntimeError("networksetup %s failed: %s" % (args[0], ((p.stderr or p.stdout) or "").strip()))
     return p
 
 
@@ -381,6 +435,95 @@ def fastest_dns():
     if res[0][0] == float("inf"):
         raise RuntimeError("no DNS provider reachable")
     return res[0][1], res
+
+
+# ------------------------------------------------- reachability check (`steamfix check`)
+
+STEAM_CHECK_HOST = "store.steampowered.com"
+STEAM_CHECK_DNS = "8.8.8.8"           # == DNS_SETS["google"][0], spelled out so the check reads plainly
+CHECK_TIMEOUT = 4                     # per TLS attempt, as promised by the CLI help
+VERDICTS = ("ok", "dns_poisoned", "dpi_blocked", "offline")
+
+
+def system_resolve(host=STEAM_CHECK_HOST):
+    """IPv4 addresses for host from the resolver macOS actually uses.
+
+    Raises OSError when the system cannot resolve; the system resolver applies its
+    own timeout, so this takes none.
+    """
+    return list(dict.fromkeys(a[4][0] for a in socket.getaddrinfo(host, 443, socket.AF_INET)))
+
+
+def google_resolve(host=STEAM_CHECK_HOST, timeout=CHECK_TIMEOUT, server=STEAM_CHECK_DNS):
+    """IPv4 addresses for host from one plain DNS server (8.8.8.8 by default). Raises on failure."""
+    return dns_query(host, server, timeout)
+
+
+def tls_handshake(ip, host=STEAM_CHECK_HOST, timeout=CHECK_TIMEOUT):
+    """True when a TLS handshake to ip:443 with SNI=host completes inside ``timeout``.
+
+    The certificate is deliberately not verified: the question is whether a handshake
+    can happen at all, so a captive portal or MITM must not be read as "line blocked".
+    """
+    ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+    ctx.check_hostname = False
+    ctx.verify_mode = ssl.CERT_NONE
+    try:
+        with socket.create_connection((ip, 443), timeout=timeout) as raw:
+            with ctx.wrap_socket(raw, server_hostname=host):
+                return True
+    except (OSError, ValueError):        # SSLError/timeout are OSError; ValueError = bad ip literal
+        return False
+
+
+def _first(fn, *args):
+    """First address fn returns, or None when it raises or has nothing (never propagates)."""
+    try:
+        ips = fn(*args)
+    except Exception:
+        return None
+    return ips[0] if ips else None
+
+
+def _verdict(verdict, system_ip, google_ip, detail):
+    return {"verdict": verdict, "system_ip": system_ip, "google_ip": google_ip, "detail": detail}
+
+
+def check_steam(host=STEAM_CHECK_HOST, timeout=CHECK_TIMEOUT):
+    """Decide whether this network blocks or poisons Steam. Returns
+    {'verdict', 'system_ip', 'google_ip', 'detail'} with verdict one of VERDICTS.
+
+    ok           TLS works through the system resolver: nothing to fix.
+    dns_poisoned the system resolver hands out a dead/forged address (or nothing at all)
+                 while 8.8.8.8 works: fixing the DNS is what helps.
+    dpi_blocked  the address is right but the TLS handshake dies on both paths: the proxy helps.
+    offline      nothing resolves, not even over 8.8.8.8: no internet, not a Steam problem.
+    """
+    system_ip = _first(system_resolve, host)
+    google_ip = _first(google_resolve, host, timeout)
+    if system_ip is None and google_ip is None:
+        return _verdict("offline", None, None,
+                        "neither the system resolver nor %s returned an address for %s"
+                        % (STEAM_CHECK_DNS, host))
+    if system_ip is not None and tls_handshake(system_ip, host, timeout):
+        return _verdict("ok", system_ip, google_ip,
+                        "TLS to %s works from the system address %s" % (host, system_ip))
+    if google_ip is not None and tls_handshake(google_ip, host, timeout):
+        if system_ip is None:
+            return _verdict("dns_poisoned", None, google_ip,
+                            "the system resolver returned nothing for %s, while %s resolved %s "
+                            "and its TLS handshake works" % (host, STEAM_CHECK_DNS, google_ip))
+        if system_ip == google_ip:
+            return _verdict("ok", system_ip, google_ip,
+                            "the system address %s failed once but answered TLS on retry" % system_ip)
+        return _verdict("dns_poisoned", system_ip, google_ip,
+                        "the system resolver returns %s, which does not reach Steam, while %s "
+                        "resolves %s and its TLS handshake works"
+                        % (system_ip, STEAM_CHECK_DNS, google_ip))
+    return _verdict("dpi_blocked", system_ip, google_ip,
+                    "the TLS handshake to %s failed on both %s and %s"
+                    % (host, system_ip or "the system address (none resolved)",
+                       google_ip or "the %s address (none resolved)" % STEAM_CHECK_DNS))
 
 
 # ------------------------------------------------------------------ TLS ClientHello
