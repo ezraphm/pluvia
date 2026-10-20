@@ -1,7 +1,57 @@
 import AppKit
+import QuartzCore
 
 // Game Launcher window (menu bar → "Open GameON…"): start/stop the watcher and the Steam Fix, and play
 // any installed game in one click. All logic still lives in gamefocus.py; this window only shells out.
+
+// Card metrics. Cards are placed by frame in rebuildGrid (nested stack views mis-sized them), so these are the
+// only source of sizes: Steam's 600x900 cover art gets a portrait tile, everything else keeps the compact card.
+let cardGap: CGFloat = 12
+let compactCardH: CGFloat = 92
+let coverCardW: CGFloat = 140
+let coverCardH: CGFloat = 210
+
+/// Bottom scrim of a cover card: an NSVisualEffectView masked by a CAGradientLayer that fades it out upward, so
+/// the game name and Play stay readable over any artwork without a hard edge.
+final class BlurScrim: NSView {
+    private let effect = NSVisualEffectView()
+    private let fade = CAGradientLayer()
+
+    override init(frame frameRect: NSRect) {
+        super.init(frame: frameRect)
+        wantsLayer = true
+        effect.material = .hudWindow
+        effect.blendingMode = .withinWindow
+        effect.state = .active
+        effect.frame = bounds
+        effect.autoresizingMask = [.width, .height]
+        addSubview(effect)
+
+        // Opaque at the bottom (layer y = 0), clear at the top; the mask only keeps the blur where text sits.
+        fade.colors = [NSColor.black.cgColor, NSColor.black.cgColor, NSColor.black.withAlphaComponent(0).cgColor]
+        fade.locations = [0, 0.45, 1]
+        fade.startPoint = CGPoint(x: 0.5, y: 0)
+        fade.endPoint = CGPoint(x: 0.5, y: 1)
+        fade.frame = bounds
+        layer?.mask = fade
+    }
+
+    required init?(coder: NSCoder) { fatalError("not used") }
+
+    override func layout() {
+        super.layout()
+        CATransaction.begin()
+        CATransaction.setDisableActions(true) // resizing the window must not animate the mask
+        fade.frame = bounds
+        CATransaction.commit()
+    }
+}
+
+/// Right-click anywhere on a card (its labels and buttons included) opens the same menu.
+func attachMenu(_ menu: NSMenu, to view: NSView) {
+    view.menu = menu
+    for v in view.subviews { attachMenu(menu, to: v) }
+}
 
 // Specific to this bundle, so pgrep/pkill can never match another gamefocus session.
 let steamfixPattern = "\(scriptPath) steamfix run"
@@ -164,7 +214,8 @@ final class Launcher: NSObject, NSWindowDelegate, NSSearchFieldDelegate {
     }
 
     func columnCount() -> Int {
-        max(1, min(6, Int(max(scroll.contentView.bounds.width, 320) / 220)))
+        // ~180pt per column keeps the 140pt portrait covers from touching each other at any window width.
+        max(1, min(6, Int(max(scroll.contentView.bounds.width, 320) / 180)))
     }
 
     func act(_ f: @escaping () -> Void) -> Act { let a = Act(f); acts.append(a); return a }
@@ -198,17 +249,23 @@ final class Launcher: NSObject, NSWindowDelegate, NSSearchFieldDelegate {
             showMessage(text)
             return
         }
-        let gap: CGFloat = 12, cardH: CGFloat = 92
         let width = scroll.contentView.bounds.width
-        let cardW = max((width - gap * CGFloat(columns - 1)) / CGFloat(columns), 140)
+        let cardW = max((width - cardGap * CGFloat(columns - 1)) / CGFloat(columns), coverCardW)
+        // One row height for the whole grid: a row with covers is as tall as a cover, and compact cards are
+        // centered in that slot, so columns stay aligned and filtering by search never shifts the layout.
+        let cardH = shown.contains(where: hasCover) ? coverCardH : compactCardH
         for (i, g) in shown.enumerated() {
-            let c = card(g)
-            c.frame = NSRect(x: CGFloat(i % columns) * (cardW + gap), y: CGFloat(i / columns) * (cardH + gap),
-                             width: cardW, height: cardH)
+            let cover = hasCover(g)
+            let c = cover ? coverCard(g) : card(g)
+            let w = cover ? min(coverCardW, cardW) : cardW
+            let h = cover ? coverCardH : compactCardH
+            c.frame = NSRect(x: CGFloat(i % columns) * (cardW + cardGap) + (cardW - w) / 2,
+                             y: CGFloat(i / columns) * (cardH + cardGap) + (cardH - h) / 2,
+                             width: w, height: h)
             doc.addSubview(c)
         }
         let rows = (shown.count + columns - 1) / columns
-        doc.frame = NSRect(x: 0, y: 0, width: width, height: CGFloat(rows) * (cardH + gap) + 16)
+        doc.frame = NSRect(x: 0, y: 0, width: width, height: CGFloat(rows) * (cardH + cardGap) + 16)
     }
 
     func card(_ g: [String: String]) -> NSView {
@@ -239,6 +296,7 @@ final class Launcher: NSObject, NSWindowDelegate, NSSearchFieldDelegate {
             guard let id = g["id"], !id.isEmpty else { return }
             self?.play(id)
         }
+        let optionsAct = cardAct { [weak self] in self?.editLaunchOptions(g) }
         let playButton = NSButton(title: "Play", target: a, action: #selector(Act.go))
         playButton.bezelStyle = .rounded
         playButton.controlSize = .small
@@ -262,7 +320,121 @@ final class Launcher: NSObject, NSWindowDelegate, NSSearchFieldDelegate {
             playButton.trailingAnchor.constraint(equalTo: content.trailingAnchor, constant: -10),
             playButton.bottomAnchor.constraint(equalTo: content.bottomAnchor, constant: -10),
         ])
+        attachMenu(cardMenu(g, play: a, options: optionsAct), to: box)
         return box
+    }
+
+    /// Portrait cover card: the Steam librarycache 600x900 art fills the tile (aspect fill, clipped to the rounded
+    /// corners), with the name and Play on the bottom blur. Right-click (or "…") opens launch options.
+    func coverCard(_ g: [String: String]) -> NSView {
+        let box = NSView(frame: NSRect(x: 0, y: 0, width: coverCardW, height: coverCardH))
+        box.setAccessibilityLabel(g["name"] ?? "Game")
+        box.wantsLayer = true
+        box.layer?.cornerRadius = 10
+        box.layer?.masksToBounds = true
+        box.layer?.borderWidth = 1
+        box.layer?.borderColor = NSColor.separatorColor.cgColor
+        box.layer?.backgroundColor = NSColor.black.cgColor
+        if let img = coverImage(g), let cg = img.cgImage(forProposedRect: nil, context: nil, hints: nil) {
+            box.layer?.contentsGravity = .resizeAspectFill
+            box.layer?.contents = cg
+        }
+
+        let scrim = BlurScrim(frame: NSRect(x: 0, y: 0, width: coverCardW, height: 78))
+        box.addSubview(scrim)
+
+        let a = cardAct { [weak self] in
+            guard let id = g["id"], !id.isEmpty else { return }
+            self?.play(id)
+        }
+        let optionsAct = cardAct { [weak self] in self?.editLaunchOptions(g) }
+
+        let name = NSTextField(wrappingLabelWithString: g["name"] ?? "?")
+        name.font = .boldSystemFont(ofSize: 11)
+        name.maximumNumberOfLines = 2
+        name.lineBreakMode = .byTruncatingTail
+        name.textColor = .labelColor
+        name.frame = NSRect(x: 10, y: 30, width: coverCardW - 20, height: 32)
+
+        let playButton = NSButton(title: "Play", target: a, action: #selector(Act.go))
+        playButton.bezelStyle = .rounded
+        playButton.controlSize = .small
+        playButton.frame = NSRect(x: 10, y: 6, width: 56, height: 20)
+
+        let more = NSButton(title: "…", target: optionsAct, action: #selector(Act.go))
+        more.isBordered = false
+        more.toolTip = "Launch options…"
+        more.font = .boldSystemFont(ofSize: 13)
+        more.frame = NSRect(x: 68, y: 6, width: 26, height: 20)
+
+        box.addSubview(name)
+        box.addSubview(playButton)
+        box.addSubview(more)
+        attachMenu(cardMenu(g, play: a, options: optionsAct), to: box)
+        return box
+    }
+
+    /// Right-click menu shared by both card styles: the game as a disabled header, then Play and launch options.
+    func cardMenu(_ g: [String: String], play: Act, options: Act) -> NSMenu {
+        let m = NSMenu()
+        let head = NSMenuItem(title: g["name"] ?? "?", action: nil, keyEquivalent: "")
+        head.isEnabled = false
+        m.addItem(head)
+        m.addItem(.separator())
+        let p = m.addItem(withTitle: "Play", action: #selector(Act.go), keyEquivalent: "")
+        p.target = play
+        let o = m.addItem(withTitle: "Launch options…", action: #selector(Act.go), keyEquivalent: "")
+        o.target = options
+        return m
+    }
+
+    /// Per-game launch options: the value is read from disk when the sheet opens, and saved through
+    /// `Prefs.setLaunchOption`, which re-reads config.json and replaces just that one key (no stale write-back).
+    func editLaunchOptions(_ g: [String: String]) {
+        guard let id = g["id"], !id.isEmpty, let win = window else { return }
+        let field = NSTextField(string: launchOptionValue(id))
+        field.frame = NSRect(x: 0, y: 0, width: 380, height: 24)
+        field.font = .systemFont(ofSize: 12)
+        field.placeholderString = (g["steam_options"]).map { "Steam: \($0)" }
+            ?? "e.g. FOO=1 %command% -windowed"
+
+        let alert = NSAlert()
+        alert.messageText = "Launch options — \(g["name"] ?? id)"
+        alert.informativeText = "Steam syntax (VAR=x %command% -arg). Leave it empty to clear this game's options."
+        alert.accessoryView = field
+        alert.addButton(withTitle: "Save")
+        alert.addButton(withTitle: "Cancel")
+        let save: (NSApplication.ModalResponse) -> Void = { response in
+            guard response == .alertFirstButtonReturn else { return }
+            prefs.setLaunchOption(id, field.stringValue.trimmingCharacters(in: .whitespacesAndNewlines))
+        }
+        if win.isVisible {
+            alert.beginSheetModal(for: win, completionHandler: save)
+            DispatchQueue.main.async {
+                win.makeFirstResponder(field)
+                field.currentEditor()?.selectAll(nil)
+            }
+        } else {
+            save(alert.runModal())
+        }
+    }
+
+    /// Current value of launch_options[<id>] straight from the file, so a window that has been open for a while
+    /// still shows what is really saved.
+    func launchOptionValue(_ id: String) -> String {
+        guard let d = FileManager.default.contents(atPath: home + "/config.json"),
+              let j = try? JSONSerialization.jsonObject(with: d) as? [String: Any],
+              let o = j["launch_options"] as? [String: Any] else { return "" }
+        return o[id] as? String ?? ""
+    }
+
+    /// Steam keeps portrait library art at appcache/librarycache/<appid>/library_600x900.jpg; `games --json` only
+    /// reports `icon` when that file exists, so the key alone decides the card style (no JPEG decode per rebuild).
+    func hasCover(_ g: [String: String]) -> Bool { !(g["icon"] ?? "").isEmpty }
+
+    func coverImage(_ g: [String: String]) -> NSImage? {
+        guard let path = g["icon"], !path.isEmpty else { return nil }
+        return NSImage(contentsOfFile: path) // local Steam cache only, nothing is downloaded
     }
 
     func gameIcon(_ g: [String: String]) -> NSImage? {
