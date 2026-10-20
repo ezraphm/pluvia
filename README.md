@@ -15,11 +15,22 @@ python3 gamefocus.py status | restore      # pending snapshot / crash recovery
 python3 gamefocus.py games [--json]         # installed games: Steam, Epic, GOG, App Store
 python3 gamefocus.py play <id>              # steam:<appid> | epic:<app> | gog:<id> | mas:<bundle>
 python3 gamefocus.py watch [--dry-run]    # auto-run profiles with "watch": true when their game starts
+python3 gamefocus.py steamfix run [--dns NAME] [--dry-run]  # Steam DNS/proxy fix, foreground, restores on exit
+python3 gamefocus.py steamfix status [--json]               # applied? server running?
+python3 gamefocus.py steamfix restore                        # undo the DNS/PAC settings
 python3 -m unittest discover -s tests
 ```
 
 Config: `game.match` is a regex on the executable **path** (`ps comm=`), not the bundle id
 (`find` first). `quit[].restore` = `auto` | `late` | `manual`; a typo is a config error.
+
+## Steam connection fix
+`steamfix run` points the active network service at a loopback PAC/CONNECT proxy for Steam domains and
+sets the DNS servers (user-level `networksetup`, no sudo), then serves in the foreground. It always
+undoes the settings on exit (Ctrl+C, SIGTERM, SIGHUP, error), and `run`/`watch`/`resume-all` undo a
+session whose server died. `--dns` takes `google`, `cloudflare`, `controld`, `quad9`, `opendns`,
+`adguard`, `nextdns`, `alidns`, `dnssb`, `comodo` or `fastest`; without it the config's
+`steamfix: {"dns": "google"}` applies (default `google`).
 
 ## Actions per app
 `quit[].action` = `quit` (default) | `demote` (`taskpolicy -b`: E-cores, low IO) | `pause` (SIGSTOP the app's

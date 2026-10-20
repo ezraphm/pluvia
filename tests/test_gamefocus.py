@@ -1,3 +1,4 @@
+import argparse
 import json
 import os
 import plistlib
@@ -720,6 +721,194 @@ class LibraryWatch(unittest.TestCase):
              mock.patch.object(gf, "ancestor_pids", return_value=set()), \
              mock.patch.object(gf, "proc_table", return_value={}):
             self.assertEqual(gf.running_apps_json(), [{"name": "A", "bundle": "a.b", "ram_mb": 12, "kind": "app"}])
+
+
+class Steamfix(IsolatedHome):
+    """Every steamfix / networksetup / subprocess call is mocked: these tests must never touch the real DNS."""
+
+    def setUp(self):
+        super().setUp()
+        import steamfix  # noqa: E402  (imported here on purpose: only this class needs it)
+        self.sf = steamfix
+        self.steam_state = gf.STEAMFIX_STATE  # before the patch, to compare with steamfix.STATE
+        for name, val in (("CONFIG", os.path.join(self.tmp.name, "config.json")),
+                          ("STEAMFIX_STATE", os.path.join(self.tmp.name, "saf-state.json"))):
+            p = mock.patch.object(gf, name, val)
+            p.start()
+            self.addCleanup(p.stop)
+        self.state = gf.STEAMFIX_STATE
+
+    def write_config(self, **extra):
+        cfg = {"settings": dict(ST), "keep": [], "profiles": {}}
+        cfg.update(extra)
+        os.makedirs(os.path.dirname(gf.CONFIG), exist_ok=True)
+        with open(gf.CONFIG, "w", encoding="utf-8") as f:
+            json.dump(cfg, f)
+
+    def run_cmd(self, dns=None, dry=False, serve=None, apply_side=None, restore_side=None):
+        """Run cmd_steamfix_run with the network side fully mocked; return (calls, printed lines)."""
+        calls, out = [], []
+        with mock.patch.object(self.sf, "active_service", return_value="Wi-Fi"), \
+             mock.patch.object(self.sf, "pac_url", return_value="http://127.0.0.1:31627/proxy.pac"), \
+             mock.patch.object(self.sf, "apply_network",
+                               side_effect=apply_side or (lambda *a: calls.append(("apply",) + a))), \
+             mock.patch.object(self.sf, "serve",
+                               side_effect=serve or (lambda **k: calls.append(("serve", k)))), \
+             mock.patch.object(self.sf, "restore_network",
+                               side_effect=restore_side or (lambda: calls.append(("restore",)))), \
+             mock.patch("builtins.print", side_effect=lambda *a, **k: out.append(" ".join(map(str, a)))):
+            gf.cmd_steamfix_run(argparse.Namespace(dns=dns, dry_run=dry))
+        return calls, out
+
+    def test_apply_then_serve_then_always_restore(self):
+        calls, _ = self.run_cmd(dns="cloudflare")
+        self.assertEqual(calls, [("apply", "Wi-Fi", "cloudflare", "http://127.0.0.1:31627/proxy.pac"),
+                                 ("serve", {"dns": "cloudflare"}),
+                                 ("restore",)])
+
+    def test_run_refuses_while_another_server_runs(self):
+        with mock.patch.object(gf, "steamfix_running", return_value=[4242]):
+            with self.assertRaises(SystemExit):
+                self.run_cmd()
+
+    def test_restore_runs_even_when_serve_raises(self):
+        restored = []
+        with mock.patch.object(self.sf, "active_service", return_value="Wi-Fi"), \
+             mock.patch.object(self.sf, "pac_url", return_value="http://127.0.0.1:31627/proxy.pac"), \
+             mock.patch.object(self.sf, "apply_network") as apply_n, \
+             mock.patch.object(self.sf, "serve", side_effect=RuntimeError("proxy died")), \
+             mock.patch.object(self.sf, "restore_network", side_effect=lambda: restored.append(1)):
+            with self.assertRaises(RuntimeError):
+                gf.cmd_steamfix_run(argparse.Namespace(dns="google", dry_run=False))
+        apply_n.assert_called_once_with("Wi-Fi", "google", "http://127.0.0.1:31627/proxy.pac")
+        self.assertEqual(restored, [1])
+
+    def test_ctrl_c_during_serve_is_quiet_and_restores(self):
+        calls, _ = self.run_cmd(dns="google", serve=lambda **k: (_ for _ in ()).throw(KeyboardInterrupt()))
+        self.assertEqual([c[0] for c in calls], ["apply", "restore"])
+
+    def test_dry_run_prints_the_plan_and_changes_nothing(self):
+        calls, out = self.run_cmd(dns="google", dry=True)
+        text = "\n".join(out)
+        self.assertEqual(calls, [])
+        self.assertIn("Wi-Fi", text)
+        self.assertIn("8.8.8.8, 8.8.4.4 (google)", text)
+        self.assertIn("http://127.0.0.1:31627/proxy.pac", text)
+        self.assertIn("nothing changed", text)
+
+    def test_config_dns_is_the_default_and_flag_wins(self):
+        self.write_config(steamfix={"dns": "cloudflare"})
+        calls, out = self.run_cmd(dns=None, dry=True)
+        self.assertEqual(calls, [])
+        self.assertIn("1.1.1.1, 1.0.0.1 (cloudflare)", "\n".join(out))
+        calls, _ = self.run_cmd(dns="quad9")
+        self.assertEqual(calls[0][2], "quad9")
+
+    def test_fastest_dns_is_resolved_before_applying(self):
+        self.write_config(steamfix={"dns": "fastest"})
+        calls = []
+        with mock.patch.object(self.sf, "fastest_dns", return_value=("quad9", [(1.0, "quad9")])), \
+             mock.patch.object(self.sf, "active_service", return_value="Wi-Fi"), \
+             mock.patch.object(self.sf, "pac_url", return_value="http://127.0.0.1:31627/proxy.pac"), \
+             mock.patch.object(self.sf, "apply_network", side_effect=lambda *a: calls.append(a)), \
+             mock.patch.object(self.sf, "serve"), mock.patch.object(self.sf, "restore_network"), \
+             mock.patch("builtins.print"):
+            gf.cmd_steamfix_run(argparse.Namespace(dns=None, dry_run=False))
+        self.assertEqual(calls, [("Wi-Fi", "quad9", "http://127.0.0.1:31627/proxy.pac")])
+
+    def test_unknown_dns_exits_before_touching_anything(self):
+        with mock.patch.object(self.sf, "active_service", return_value="Wi-Fi"), \
+             mock.patch.object(self.sf, "apply_network") as apply_n, mock.patch.object(self.sf, "serve") as serve:
+            with self.assertRaises(SystemExit):
+                gf.cmd_steamfix_run(argparse.Namespace(dns="nope", dry_run=False))
+        apply_n.assert_not_called()
+        serve.assert_not_called()
+
+    def test_watchdog_restores_only_with_state_and_no_server(self):
+        with mock.patch.object(self.sf, "restore_network", return_value="Wi-Fi") as restore, \
+             mock.patch.object(gf, "steamfix_running", return_value=[]):
+            self.assertIsNone(gf.steamfix_watchdog())          # no state file: nothing to do
+            restore.assert_not_called()
+            open(self.state, "w").close()
+            self.assertEqual(gf.steamfix_watchdog(), "Wi-Fi")   # stale state, no server: undo it
+            self.assertEqual(restore.call_count, 1)
+        with mock.patch.object(self.sf, "restore_network") as restore, \
+             mock.patch.object(gf, "steamfix_running", return_value=[4242]):
+            self.assertIsNone(gf.steamfix_watchdog())          # server alive: leave it alone
+            restore.assert_not_called()
+
+    def test_watchdog_tolerates_a_failing_restore(self):
+        open(self.state, "w").close()
+        with mock.patch.object(gf, "steamfix_running", return_value=[]), \
+             mock.patch.object(self.sf, "restore_network", side_effect=ValueError("bad state")):
+            self.assertIsNone(gf.steamfix_watchdog())
+
+    def test_watchdogs_resume_freezes_then_steamfix(self):
+        order = []
+        with mock.patch.object(gf, "resume_frozen", side_effect=lambda: order.append("frozen") or 0), \
+             mock.patch.object(gf, "steamfix_watchdog", side_effect=lambda: order.append("steamfix")):
+            gf._watchdogs()
+        self.assertEqual(order, ["frozen", "steamfix"])
+
+    def test_running_uses_pgrep_and_never_matches_self(self):
+        with mock.patch.object(gf, "sh", return_value=(0, "111\n222\n333\n", "")) as sh, \
+             mock.patch.object(gf.os, "getpid", return_value=111), mock.patch.object(gf.os, "getppid", return_value=222):
+            self.assertEqual(gf.steamfix_running(), [333])
+        self.assertEqual(sh.call_args.args[0], ["pgrep", "-f", gf.STEAMFIX_PROC])
+
+    def test_status_json_reports_whether_a_server_is_serving(self):
+        out, st = [], {"active": True, "svc": "Wi-Fi", "dns": ["8.8.8.8", "8.8.4.4"]}
+        with mock.patch.object(self.sf, "status", return_value=dict(st)), \
+             mock.patch.object(gf, "steamfix_running", return_value=[42]), \
+             mock.patch("builtins.print", side_effect=lambda *a, **k: out.append(" ".join(map(str, a)))):
+            gf.cmd_steamfix_status(argparse.Namespace(json=True))
+        self.assertEqual(json.loads(out[-1]), dict(st, serving=True))
+        out = []
+        with mock.patch.object(self.sf, "status", return_value={"active": False, "svc": None, "dns": []}), \
+             mock.patch.object(gf, "steamfix_running", return_value=[]), \
+             mock.patch("builtins.print", side_effect=lambda *a, **k: out.append(" ".join(map(str, a)))):
+            gf.cmd_steamfix_status(argparse.Namespace(json=False))
+        self.assertIn("not applied", "\n".join(out))
+        self.assertIn("serving: no", out[-1])
+
+    def test_restore_command_is_safe_when_nothing_was_applied(self):
+        out = []
+        with mock.patch.object(self.sf, "restore_network", return_value=None) as restore, \
+             mock.patch("builtins.print", side_effect=lambda *a, **k: out.append(" ".join(map(str, a)))):
+            gf.cmd_steamfix_restore(argparse.Namespace())
+        restore.assert_called_once()
+        self.assertIn("Nothing to restore", out[-1])
+
+    def test_resume_all_runs_the_steamfix_watchdog(self):
+        with mock.patch.object(gf, "resume_frozen", return_value=0), \
+             mock.patch.object(gf, "steamfix_watchdog") as wd, \
+             mock.patch.object(gf, "load_snapshot", return_value=None), mock.patch("builtins.print"):
+            gf.cmd_resume_all(argparse.Namespace())
+        wd.assert_called_once()
+
+    def test_validate_steamfix_key(self):
+        base = {"profiles": {}}
+        self.assertEqual(gf.validate_config(dict(base, steamfix={"dns": "google"})), [])
+        self.assertEqual(gf.validate_config(dict(base, steamfix={"dns": "fastest"})), [])
+        self.assertEqual(gf.validate_config(dict(base, steamfix={})), [])
+        self.assertEqual(len(gf.validate_config(dict(base, steamfix={"dns": "nope"}))), 1)
+        self.assertEqual(len(gf.validate_config(dict(base, steamfix={"dns": 5}))), 1)
+        self.assertEqual(len(gf.validate_config(dict(base, steamfix="google"))), 1)
+        self.assertIn("steamfix.dns", gf.validate_config(dict(base, steamfix={"dns": "nope"}))[0])
+
+    def test_mirrored_constants_match_steamfix(self):
+        self.assertEqual(self.steam_state, self.sf.STATE)
+        self.assertEqual(set(gf.STEAMFIX_DNS_SETS), set(self.sf.DNS_SETS))
+
+    def test_cli_parses_the_steamfix_subcommands(self):
+        for argv in (["steamfix", "run", "--dry-run"], ["steamfix", "run", "--dns", "quad9"],
+                     ["steamfix", "status", "--json"], ["steamfix", "restore"]):
+            with mock.patch.object(sys, "argv", ["gamefocus.py"] + argv), \
+                 mock.patch.object(gf, "cmd_steamfix_run") as run, \
+                 mock.patch.object(gf, "cmd_steamfix_status") as status, \
+                 mock.patch.object(gf, "cmd_steamfix_restore") as restore:
+                gf.main()
+            self.assertEqual(run.call_count + status.call_count + restore.call_count, 1)
 
 
 if __name__ == "__main__":

@@ -225,6 +225,8 @@ def apply_network(svc, dns_name, pac_url, mtu=None):
     dns_name = _check_dns_name(dns_name)
     url = _check_pac_url(pac_url)
     mtu = _check_mtu(mtu)
+    if os.path.lexists(STATE):  # a 2nd save_state would record OUR settings as the "original" ones
+        raise RuntimeError("already applied (%s exists): run restore first" % STATE)
     save_state(svc)
     _networksetup("-setdnsservers", svc, *DNS_SETS[dns_name], check=True)
     flush_dns()

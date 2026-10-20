@@ -5,7 +5,7 @@ cd "$(dirname "$0")"
 APP=build/GameON.app
 rm -rf "$APP" && mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
 swiftc -O -swift-version 5 main.swift -o "$APP/Contents/MacOS/GameON"
-cp ../gamefocus.py "$APP/Contents/Resources/gamefocus.py"
+cp ../gamefocus.py ../steamfix.py "$APP/Contents/Resources/"
 cat > "$APP/Contents/Info.plist" <<PL
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">

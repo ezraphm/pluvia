@@ -242,6 +242,15 @@ class StateFile(unittest.TestCase):
             ["networksetup", "-setautoproxystate", "Wi-Fi", "on"],
         ])
 
+    def test_second_apply_is_refused_and_keeps_the_original_state(self):
+        sf.apply_network("Wi-Fi", "google", PAC)
+        first = self.state()
+        n = len(self.calls)
+        with self.assertRaises(RuntimeError):
+            sf.apply_network("Wi-Fi", "cloudflare", PAC)
+        self.assertEqual(self.state(), first)
+        self.assertEqual(len(self.calls), n)
+
     def test_apply_with_mtu_sets_it_before_the_proxy(self):
         sf.apply_network("Ethernet", "google", PAC, mtu=1500)
         self.assertEqual(self.calls[3], ["networksetup", "-setMTU", "Ethernet", "1500"])

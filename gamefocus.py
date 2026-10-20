@@ -13,6 +13,9 @@ Typical workflow
     python3 gamefocus.py run mygame --dry-run # preview, changes nothing
     python3 gamefocus.py run mygame           # quit apps, play, restore after exit
     python3 gamefocus.py restore              # crash recovery: restore last snapshot
+    python3 gamefocus.py steamfix run         # Steam DNS/proxy via steamfix.py (no root), restores on exit
+    python3 gamefocus.py steamfix status      # is the fix applied / is a server running
+    python3 gamefocus.py steamfix restore     # undo the network settings (safe when nothing was applied)
 
 Safety rules built in
   * Apps are asked to quit politely (AppleScript "quit"). Never force-killed.
@@ -39,6 +42,14 @@ HOME_DIR = os.path.expanduser("~/.gamefocus")
 CONFIG = os.path.join(HOME_DIR, "config.json")
 SNAPSHOT = os.path.join(HOME_DIR, "snapshot.json")
 LOGFILE = os.path.join(HOME_DIR, "gamefocus.log")
+
+# steamfix.py is imported lazily: only the `steamfix` commands and the crash watchdog use it. These constants
+# mirror its own so config validation and the watchdog need no import (tests keep them in sync).
+STEAMFIX_STATE = "/var/tmp/saf-state.json"          # == steamfix.STATE
+STEAMFIX_DNS_SETS = ("google", "cloudflare", "controld", "quad9", "opendns", "adguard", "nextdns",
+                     "alidns", "dnssb", "comodo")   # == tuple(steamfix.DNS_SETS)
+STEAMFIX_DNS_NAMES = STEAMFIX_DNS_SETS + ("fastest",)
+STEAMFIX_PROC = "gamefocus[.]py steamfix run"       # pgrep -f pattern for a live steamfix server
 
 NEVER_QUIT = set(b.lower() for b in [
     "dev.gameon.menubar",
@@ -514,6 +525,19 @@ def _validate_library_watch(cfg, profiles, errs):
         errs.append("library_watch.exclude must be a list of game ids")
 
 
+def _validate_steamfix(cfg, errs):
+    """Optional top-level `steamfix: {"dns": "google"}`: the DNS set `steamfix run` uses by default."""
+    sfx = cfg.get("steamfix")
+    if sfx is None:
+        return
+    if not isinstance(sfx, dict):
+        errs.append('steamfix must be an object: {"dns": "google"}')
+        return
+    dns = sfx.get("dns")
+    if dns is not None and (not isinstance(dns, str) or dns not in STEAMFIX_DNS_NAMES):
+        errs.append("steamfix.dns must be one of: %s, got %r" % (", ".join(STEAMFIX_DNS_NAMES), dns))
+
+
 def validate_config(cfg):
     """Return a list of human-readable problems (empty = OK)."""
     errs = []
@@ -526,6 +550,7 @@ def validate_config(cfg):
         return errs  # if profiles itself is wrong, skip the rest (matches the original early return)
     _validate_launch_options(cfg, errs)
     _validate_library_watch(cfg, profiles, errs)
+    _validate_steamfix(cfg, errs)
     return errs
 
 
@@ -733,6 +758,117 @@ def _raise_interrupt(signum, frame):
 def _install_signals():
     signal.signal(signal.SIGTERM, _raise_interrupt)
     signal.signal(signal.SIGHUP, _raise_interrupt)
+
+
+# ---------------------------------------------------------------------- steamfix
+# steamfix.py is imported inside these functions only, so every other command works (and its tests run)
+# without it. `networksetup` works without sudo for admin users, so nothing here needs root.
+def _steamfix():
+    import steamfix  # noqa: E402  (lazy on purpose: see above)
+    return steamfix
+
+
+def steamfix_running():
+    """pids of live `gamefocus.py steamfix run` servers, never our own (see _self_pids: that helper
+    matches every gamefocus process, and the server itself IS one)."""
+    rc, out, _ = sh(["pgrep", "-f", STEAMFIX_PROC])
+    me = {os.getpid(), os.getppid()}
+    return sorted(int(t) for t in out.split() if t.isdigit() and int(t) not in me)
+
+
+def steamfix_watchdog():
+    """Undo a *dead* steamfix session: state file left behind but no server running. Returns the service or None."""
+    if not os.path.exists(STEAMFIX_STATE) or steamfix_running():
+        return None
+    sf = _steamfix()
+    try:
+        svc = sf.restore_network()
+    except Exception as e:  # a stale state file must never stop run/watch
+        log("watchdog: could not undo the steamfix network settings: %s" % e)
+        return None
+    log("watchdog: steamfix did not exit cleanly - restored the network settings%s"
+        % (" of %r" % svc if svc else ""))
+    return svc
+
+
+def _watchdogs():
+    """Crash recovery at the start of run/watch: undo freezes, then undo a steamfix session whose server died."""
+    n = resume_frozen()
+    if n:
+        log("watchdog: resumed %d frozen app(s) from an earlier session" % n)
+    steamfix_watchdog()
+
+
+def _steamfix_restore(sf):
+    """Undo apply_network(); safe when nothing was applied (no state file -> None)."""
+    try:
+        svc = sf.restore_network()
+    except Exception as e:  # a failed restore must not hide the reason we are exiting
+        log("steamfix: could not restore the network settings: %s (state kept in %s)" % (e, STEAMFIX_STATE))
+        return None
+    log("steamfix: network settings restored%s" % (" for %r" % svc if svc else " (nothing to undo)"))
+    return svc
+
+
+def _steamfix_dns(args):
+    """--dns wins; otherwise the config's steamfix.dns; otherwise google."""
+    if getattr(args, "dns", None):
+        return args.dns
+    return (load_config().get("steamfix") or {}).get("dns") or "google"
+
+
+def cmd_steamfix_run(args):
+    """Apply DNS + PAC, serve until Ctrl+C/SIGTERM/SIGHUP, then always restore the network settings."""
+    sf = _steamfix()
+    dns = _steamfix_dns(args)
+    if dns == "fastest":
+        dns = sf.fastest_dns()[0]
+        print("fastest DNS provider: %s" % dns)
+    if dns not in sf.DNS_SETS:
+        sys.exit("Unknown DNS provider %r (choose from: %s, fastest)" % (dns, ", ".join(STEAMFIX_DNS_NAMES)))
+    svc = sf.active_service()
+    url = sf.pac_url()
+    if args.dry_run:
+        print("service:     %s" % svc)
+        print("dns servers: %s (%s)" % (", ".join(sf.DNS_SETS[dns]), dns))
+        print("pac url:     %s" % url)
+        print("Dry run: nothing changed.")
+        return
+    if steamfix_running():
+        sys.exit("steamfix is already running (pids %s)" % ", ".join(map(str, steamfix_running())))
+    steamfix_watchdog()  # state left by a dead session would otherwise be saved as the "original" settings
+    _install_signals()
+    try:
+        log("steamfix: sending Steam through %s on %r (DNS %s)" % (url, svc, dns))
+        sf.apply_network(svc, dns, url)
+        sf.serve(dns=dns)
+    except KeyboardInterrupt:
+        log("interrupted, undoing the network settings")
+    finally:
+        _steamfix_restore(sf)
+
+
+def cmd_steamfix_status(args):
+    sf = _steamfix()
+    st = dict(sf.status())
+    pids = steamfix_running()
+    st["serving"] = bool(pids)
+    if args.json:
+        print(json.dumps(st))
+        return
+    print("state:   %s" % ("applied" if st["active"] else "not applied"))
+    print("service: %s" % (st["svc"] or "-"))
+    print("dns:     %s" % (" ".join(st["dns"]) or "-"))
+    print("serving: %s" % ("yes (pid %s)" % ", ".join(map(str, pids)) if pids else "no"))
+
+
+def cmd_steamfix_restore(args):
+    sf = _steamfix()
+    try:
+        svc = sf.restore_network()
+    except Exception as e:
+        sys.exit("Could not restore the network settings: %s\nState file kept in %s" % (e, STEAMFIX_STATE))
+    print("Restored the network settings of %r." % svc if svc else "Nothing to restore (no saved steamfix state).")
 
 
 # ----------------------------------------------------------------- commands
@@ -1099,6 +1235,7 @@ def cmd_games(args):
 def cmd_resume_all(args):
     n = resume_frozen()
     print("Resumed %d paused/demoted app(s)." % n)
+    steamfix_watchdog()  # a dead steamfix session may have left our DNS/PAC applied
     if load_snapshot():
         print("Apps that were quit are still pending. Run:  python3 gamefocus.py restore")
 
@@ -1130,9 +1267,7 @@ def cmd_run(args):
     if not prof:
         sys.exit("Unknown profile '%s'. Available: %s" % (args.profile, ", ".join(cfg["profiles"]) or "none"))
     if not args.dry_run:
-        n = resume_frozen()  # watchdog: a crashed session may have left apps paused/demoted
-        if n:
-            log("watchdog: resumed %d frozen app(s) from an earlier session" % n)
+        _watchdogs()  # a crashed session may have left apps paused/demoted and DNS/proxy changed
     if load_snapshot() and not args.dry_run:
         sys.exit("A previous snapshot is still pending. Run `python3 gamefocus.py restore` first.")
     st = cfg["settings"]
@@ -1318,9 +1453,7 @@ def cmd_watch(args):
     cfg = load_config()
     _install_signals()
     if not args.dry_run:
-        n = resume_frozen()
-        if n:
-            log("watchdog: resumed %d frozen app(s) from an earlier session" % n)
+        _watchdogs()  # a crashed session may have left apps paused/demoted and DNS/proxy changed
     games, games_at, cfg_at = library_games(), time.time(), config_mtime()
     profiles = watch_profiles(cfg, games)
     log("watching %d profile(s)%s (Ctrl+C to stop)" % (len(profiles), " [dry-run]" if args.dry_run else ""))
@@ -1389,6 +1522,18 @@ def main():
     w = sub.add_parser("watch", help="auto-run profiles marked watch=true when their game starts")
     w.add_argument("--dry-run", action="store_true", help="only log detections, change nothing")
     w.set_defaults(fn=cmd_watch)
+    sfx = sub.add_parser("steamfix", help="Steam connection fix (local proxy + DNS), user-level, no root")
+    sfs = sfx.add_subparsers(dest="steamfix_cmd", required=True)
+    sfr = sfs.add_parser("run", help="apply DNS/PAC and serve until Ctrl+C (always restores on exit)")
+    sfr.add_argument("--dns", help="DNS provider: %s, fastest (default: config steamfix.dns or google)"
+                                   % ", ".join(STEAMFIX_DNS_SETS))
+    sfr.add_argument("--dry-run", action="store_true", help="print what would be set, change nothing")
+    sfr.set_defaults(fn=cmd_steamfix_run)
+    sfst = sfs.add_parser("status", help="is the fix applied, and is a server running")
+    sfst.add_argument("--json", action="store_true")
+    sfst.set_defaults(fn=cmd_steamfix_status)
+    sfs.add_parser("restore", help="undo the DNS/PAC settings (safe if nothing was applied)") \
+        .set_defaults(fn=cmd_steamfix_restore)
     args = p.parse_args()
     args.fn(args)
 
