@@ -14,7 +14,7 @@ ISPs break it. Python stdlib core (`gamefocus.py`, `steamfix.py`), thin Swift sh
 | T1 | `steamfix check [--json]`: detect whether Steam is blocked | gamefocus.py, tests | - |
 | T2 | Auto Steam Fix: `steamfix.auto` starts/stops it around `play steam:*` | gamefocus.py, tests | T1 |
 | T3 | Preferences + launcher: Steam Fix DNS/auto settings, "blocked" indicator | menubar/*.swift | T2 |
-| T4 | Launcher polish: portrait covers, per-game launch options entry | menubar/launcher.swift | T3 |
+| T4 | Launcher polish: portrait covers (name over a bottom blur: NSVisualEffectView + CAGradientLayer mask, no Glur/SwiftUI), per-game launch options entry | menubar/launcher.swift | T3 |
 | T5 | steamfix fallback for non-admin accounts (osascript admin prompt) | steamfix.py, tests | - |
 | T6 | README + credits for the Launcher and Steam Fix | README.md | T4 |
 | T7 | Sparkle 2.10 auto-update: framework via swiftc `-F` into `Contents/Frameworks`, rpath, "Check for Updates..." menu item, postpone relaunch while `~/.gamefocus/snapshot.json` exists | menubar/*.swift, build.sh | GitHub repo + EdDSA keys (user), T6 |
