@@ -25,16 +25,44 @@ python3 -m unittest discover -s tests
 Config: `game.match` is a regex on the executable **path** (`ps comm=`), not the bundle id
 (`find` first). `quit[].restore` = `auto` | `late` | `manual`; a typo is a config error.
 
-## Steam connection fix
-`steamfix run` points the active network service at a loopback PAC/CONNECT proxy for Steam domains and
-sets the DNS servers (user-level `networksetup`, no sudo), then serves in the foreground. It always
-undoes the settings on exit (Ctrl+C, SIGTERM, SIGHUP, error), and `run`/`watch`/`resume-all` undo a
-session whose server died. `--dns` takes `google`, `cloudflare`, `controld`, `quad9`, `opendns`,
-`adguard`, `nextdns`, `alidns`, `dnssb`, `comodo` or `fastest`; without it the config's
-`steamfix: {"dns": "google", "auto": false}` applies (default `google`).
-`steamfix.auto: true` makes `play` start the fix itself for Steam games when no server runs
-(`steamfix run --auto-stop`, detached), and that server stops itself — restoring DNS/proxy — once Steam has
-been closed for 60 s, or 120 s after it started if Steam never appeared.
+## GameON Launcher
+**Open GameON…** in the menu bar opens one window: **Optimize while playing** (same as Start watching), a
+**Steam Fix** switch that shows this network's verdict, and a searchable grid of every installed game. Steam
+games use their portrait cover from the local `appcache/librarycache` (nothing is downloaded); other stores
+get a compact card. **Play** starts the watcher if it is off, then runs `gamefocus.py play`; right-click a
+card for **Launch options…** (per game id, saved in `config.json`).
+
+Steam Fix in the window and in **Preferences…** is the same `steamfix` engine as the CLI (both only shell out):
+- **Check** (`steamfix check`): resolves `store.steampowered.com` through your resolver and through 8.8.8.8,
+  then tries a TLS handshake on each. Verdicts `ok` / `dns_poisoned` / `dpi_blocked` / `offline`; the window
+  shows it under the switch and warns when the network blocks Steam. While the fix is on it says "Steam Fix
+  is on" instead, because its own DNS change would skew the probe.
+- **Auto**: `steamfix.auto` ("Start automatically when I play a Steam game") makes `play` start
+  `steamfix run --auto-stop` detached when no server is running; that server stops itself 60 s after Steam
+  exits, or 120 s after it started if Steam never appeared.
+- **DNS choice**: `steamfix.dns` / the Preferences picker — google, cloudflare, controld, quad9, opendns,
+  adguard, nextdns, alidns, dnssb, comodo, or `fastest` (probes every provider and takes the quickest).
+- **Non-admin fallback**: when `networksetup` fails with an authorization error, the call is retried once
+  through the macOS admin prompt (`osascript … with administrator privileges`). Declining it changes nothing;
+  errors that are not about permissions (unknown service, bad value) never prompt.
+- **Restore on exit**: Ctrl+C, SIGTERM, SIGHUP and errors all put back the previous DNS servers and PAC/auto-proxy
+  setting from `/var/tmp/saf-state.json`; `run`/`watch`/`resume-all` also undo a session whose server died
+  (watchdog).
+- **What it does NOT do**: no VPN and no tunnel — only Steam goes through it. The PAC file sends just the
+  Steam domains (steampowered, steamcommunity, steamstatic, steamusercontent, steam-chat, steamgames,
+  steamcontent, steamserver, counter-strike.net, dota2.com, valvesoftware.com) to a loopback proxy and
+  everything else DIRECT. It does not hide your IP, bypass store region locks or fix a blocked game server.
+
+What is verified: the mechanics and the restore (applies and undoes the DNS/PAC settings; exits on Ctrl+C,
+SIGTERM and error; the watchdog undoes a crashed session) — but only on a network that does **not** block
+Steam. The bypass itself has not been verified end to end; that needs a connection that really blocks Steam
+(VN ISP), see ROADMAP.
+
+## Steam connection fix (CLI)
+`steamfix run` applies the same loopback PAC/CONNECT proxy and DNS set as the launcher's switch, then serves in
+the foreground until Ctrl+C. `--dns` overrides the config's `steamfix: {"dns": "google", "auto": false}`
+(default `google`). `steamfix status|check|restore` inspect and undo it; DNS choices, auto-stop timing and the
+restore rules are described under **GameON Launcher** above.
 
 ## Actions per app
 `quit[].action` = `quit` (default) | `demote` (`taskpolicy -b`: E-cores, low IO) | `pause` (SIGSTOP the app's
@@ -75,11 +103,21 @@ Not verified: RAM actually freed (only `ps` RSS estimates), FPS effect, Automati
 
 ## Menu bar app
 `menubar/build.sh` builds `menubar/build/GameON.app` (needs `swiftc`; the app bundles a copy of `gamefocus.py`,
-so rebuild after changing it). It is a thin shell: Start/Stop watching (+ dry-run toggle), Restore now,
-Play game (lists installed games via `gamefocus.py games`, Steam covers from the local `appcache/librarycache`, starts `watch` if off, then `gamefocus.py play <appid>`: starts Steam in the background if it is not running, then launches the game's `.app` directly (`steam://rungameid/<id>` only for "Always launch via Steam" or when no single `.app` exists)), Preferences, EMERGENCY Resume all, open config/log, Start at login (LaunchAgent). Stop watch CLI instances first: two watchers race.
+so rebuild after changing it). It is a thin shell over the CLI: **Open GameON…** (the launcher window,
+`launcher.swift`), Start/Stop watching (+ dry-run toggle), Restore now, Play game (installed games via
+`gamefocus.py games`; starts `watch` if off, then `gamefocus.py play <appid>` — Steam in the background if it
+is not running, then the game's `.app` directly, `steam://rungameid/<id>` only for "Always launch via Steam"
+or when no single `.app` exists), Preferences (apps + actions, library auto-detect, Steam Fix DNS/auto),
+EMERGENCY Resume all, open config/log, Start at login (LaunchAgent). Stop watch CLI instances first: two
+watchers race.
 
 ## Credits
 Epic/GOG/App Store library detection is a Python port of the importers in
 [Aether](https://github.com/VibeNoobNotFound/Aether) (MIT, (c) 2026 VibeNoobNotFound). Epic/GOG are untested on
 real installs here (none installed); they are covered by fixture tests only. To auto-free RAM for non-Steam games,
 add a `watch` profile whose `game.match` matches their install path.
+
+The Steam Fix (`steamfix.py`) is ported from
+[SteamAccessFix-macOS](https://github.com/ezraphm/SteamAccessFix-macOS) (MIT, (c) 2026 vuviett47, ezraphm).
+Its DNS, PAC/ClientHello-split and IP-failover logic comes from the Windows original,
+[vuviett47's SteamAccessFix](https://gitlab.com/vuviett47/SteamAccessFix) (MIT).

@@ -4,6 +4,7 @@ Goal: a game launcher for weak Macs (8 GB class) that frees RAM while playing an
 ISPs break it. Python stdlib core (`gamefocus.py`, `steamfix.py`), thin Swift shell (`menubar/`).
 
 ## Done
+- T1-T6 (2026-10-20): `steamfix check`, non-admin fallback, `steamfix.auto`, Preferences + launcher status, cover cards, README.
 - M1 `steamfix.py`: Steam DNS/PAC proxy ported from SteamAccessFix-macOS, validated `networksetup` calls.
 - M2 `gamefocus.py steamfix run|status|restore`, crash watchdog, `steamfix.dns` config. User level, no root.
 - M3 Launcher window: Optimize and Steam Fix switches, game grid, search, Play.
