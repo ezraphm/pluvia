@@ -382,6 +382,7 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate {
         // A running `watch` is adopted, never killed: status comes from pgrep, so restarting this app is harmless.
         refreshIcon()
         if CommandLine.arguments.contains("--prefs") { prefs.show() } // handy for testing/screenshots
+        if CommandLine.arguments.contains("--launcher") { launcher.show() }
         timer = Timer.scheduledTimer(withTimeInterval: 3, repeats: true) { [weak self] _ in self?.refreshIcon() }
         let c = NSWorkspace.shared.notificationCenter
         for name in [NSWorkspace.didLaunchApplicationNotification, NSWorkspace.didTerminateApplicationNotification] {
@@ -398,6 +399,8 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     func menuNeedsUpdate(_ menu: NSMenu) {
         menu.removeAllItems()
+        add(menu, "Open GameON…", #selector(openLauncher))
+        menu.addItem(.separator())
         let watching = isWatching()
         let dry = UserDefaults.standard.bool(forKey: "dryRun")
         menu.addItem(withTitle: watching ? "Watching\(dry ? " (dry-run)" : "")" : "Not watching", action: nil, keyEquivalent: "")
@@ -473,6 +476,7 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate {
         }
     }
 
+    @objc func openLauncher() { launcher.show() }
     @objc func openPrefs() { prefs.show() }
     @objc func restoreNow() { spawnDetached(["restore"]) }
     @objc func resumeAll() { spawnDetached(["resume-all"]) }

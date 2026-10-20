@@ -4,7 +4,7 @@ set -e
 cd "$(dirname "$0")"
 APP=build/GameON.app
 rm -rf "$APP" && mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
-swiftc -O -swift-version 5 main.swift -o "$APP/Contents/MacOS/GameON"
+swiftc -O -swift-version 5 main.swift launcher.swift -o "$APP/Contents/MacOS/GameON"
 cp ../gamefocus.py ../steamfix.py "$APP/Contents/Resources/"
 cat > "$APP/Contents/Info.plist" <<PL
 <?xml version="1.0" encoding="UTF-8"?>
