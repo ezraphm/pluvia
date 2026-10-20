@@ -1,4 +1,8 @@
-# GameON Launcher roadmap
+# Pluvia (GameON) launcher roadmap
+
+Name: **Pluvia**, "Less weight. More play." (chosen 2026-10-20). Personal use, not a product: no trademark/store work.
+On disk the app, executable, bundle id `dev.gameon.menubar` and `~/.gamefocus` keep the GameON name so permissions,
+LaunchAgent and running processes stay valid.
 
 Goal: a game launcher for weak Macs (8 GB class) that frees RAM while playing and keeps Steam reachable where
 ISPs break it. Python stdlib core (`gamefocus.py`, `steamfix.py`), thin Swift shell (`menubar/`).

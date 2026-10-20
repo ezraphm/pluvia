@@ -1116,6 +1116,15 @@ class SteamfixAutoStart(IsolatedHome):
 
     CFG = {"steamfix": {"auto": True}}
 
+    def setUp(self):
+        super().setUp()
+        # Never read the real /var/tmp state file (it exists while Steam Fix runs) and never wait for it.
+        for name, val in (("STEAMFIX_STATE", os.path.join(self.tmp.name, "saf-state.json")),
+                          ("STEAMFIX_AUTO_READY_WAIT", 0)):
+            p = mock.patch.object(gf, name, val)
+            p.start()
+            self.addCleanup(p.stop)
+
     def start(self, cfg=None, dry=False, running=(), popen=None):
         log = mock.Mock()
         with mock.patch.object(gf, "steamfix_running", return_value=list(running)), \
@@ -1137,7 +1146,7 @@ class SteamfixAutoStart(IsolatedHome):
         self.assertEqual(argv[0], sys.executable)
         self.assertTrue(popen.call_args.kwargs["start_new_session"])
         self.assertEqual(cmd, argv)
-        self.assertIn("starting Steam Fix", log.call_args.args[0])
+        self.assertTrue(any("starting Steam Fix" in c.args[0] for c in log.call_args_list))
 
     def test_existing_server_is_reused_not_duplicated(self):
         cmd, popen, log = self.start(running=[4242])

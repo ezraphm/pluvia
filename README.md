@@ -1,4 +1,6 @@
-# GameON (gamefocus)
+# Pluvia (gamefocus)
+
+*Less weight. More play.* Pluvia is the menu bar launcher; `gamefocus.py` is its engine. For personal use.
 
 Free RAM on a Mac mini M1 8GB while gaming, then reopen apps gently afterwards.
 Python 3 standard library only, macOS only. No sudo, no `kill -9`.
@@ -25,8 +27,8 @@ python3 -m unittest discover -s tests
 Config: `game.match` is a regex on the executable **path** (`ps comm=`), not the bundle id
 (`find` first). `quit[].restore` = `auto` | `late` | `manual`; a typo is a config error.
 
-## GameON Launcher
-**Open GameON…** in the menu bar opens one window: **Optimize while playing** (same as Start watching), a
+## Pluvia Launcher
+**Open Pluvia…** in the menu bar opens one window: **Optimize while playing** (same as Start watching), a
 **Steam Fix** switch that shows this network's verdict, and a searchable grid of every installed game. Steam
 games use their portrait cover from the local `appcache/librarycache` (nothing is downloaded); other stores
 get a compact card. **Play** starts the watcher if it is off, then runs `gamefocus.py play`; right-click a
@@ -62,7 +64,7 @@ Steam. The bypass itself has not been verified end to end; that needs a connecti
 `steamfix run` applies the same loopback PAC/CONNECT proxy and DNS set as the launcher's switch, then serves in
 the foreground until Ctrl+C. `--dns` overrides the config's `steamfix: {"dns": "google", "auto": false}`
 (default `google`). `steamfix status|check|restore` inspect and undo it; DNS choices, auto-stop timing and the
-restore rules are described under **GameON Launcher** above.
+restore rules are described under **Pluvia Launcher** above.
 
 ## Actions per app
 `quit[].action` = `quit` (default) | `demote` (`taskpolicy -b`: E-cores, low IO) | `pause` (SIGSTOP the app's
@@ -102,8 +104,8 @@ Also verified (on a throwaway `sleep`): SIGSTOP/SIGCONT, `taskpolicy -b/-B` with
 Not verified: RAM actually freed (only `ps` RSS estimates), FPS effect, Automation prompt wording.
 
 ## Menu bar app
-`menubar/build.sh` builds `menubar/build/GameON.app` (needs `swiftc`; the app bundles a copy of `gamefocus.py`,
-so rebuild after changing it). It is a thin shell over the CLI: **Open GameON…** (the launcher window,
+`menubar/build.sh` builds `menubar/build/GameON.app`, shown as "Pluvia" (needs `swiftc`; the app bundles a copy of `gamefocus.py`,
+so rebuild after changing it). It is a thin shell over the CLI: **Open Pluvia…** (the launcher window,
 `launcher.swift`), Start/Stop watching (+ dry-run toggle), Restore now, Play game (installed games via
 `gamefocus.py games`; starts `watch` if off, then `gamefocus.py play <appid>` — Steam in the background if it
 is not running, then the game's `.app` directly, `steam://rungameid/<id>` only for "Always launch via Steam"

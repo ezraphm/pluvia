@@ -1,7 +1,7 @@
 import AppKit
 import QuartzCore
 
-// Game Launcher window (menu bar → "Open GameON…"): start/stop the watcher and the Steam Fix, and play
+// Game Launcher window (menu bar → "Open Pluvia…"): start/stop the watcher and the Steam Fix, and play
 // any installed game in one click. All logic still lives in gamefocus.py; this window only shells out.
 
 // Card metrics. Cards are placed by frame in rebuildGrid (nested stack views mis-sized them), so these are the
@@ -447,7 +447,7 @@ final class Launcher: NSObject, NSWindowDelegate, NSSearchFieldDelegate {
         let w = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 760, height: 560),
                          styleMask: [.titled, .closable, .miniaturizable, .resizable],
                          backing: .buffered, defer: false)
-        w.title = "GameON"
+        w.title = "Pluvia"
         w.isReleasedWhenClosed = false
         w.minSize = NSSize(width: 520, height: 380)
         w.delegate = self

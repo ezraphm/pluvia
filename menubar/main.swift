@@ -210,7 +210,7 @@ final class Prefs: NSObject, NSTextFieldDelegate {
         if window == nil {
             let w = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 600, height: 640),
                              styleMask: [.titled, .closable, .resizable], backing: .buffered, defer: false)
-            w.title = "GameON Preferences"
+            w.title = "Pluvia Preferences"
             w.isReleasedWhenClosed = false
             let scroll = NSScrollView()
             scroll.hasVerticalScroller = true
@@ -427,13 +427,13 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate {
     func refreshIcon() {
         let active = snapshotSummary() != nil
         let name = active ? "gamecontroller.fill" : "gamecontroller"
-        item.button?.image = NSImage(systemSymbolName: name, accessibilityDescription: "GameON")
+        item.button?.image = NSImage(systemSymbolName: name, accessibilityDescription: "Pluvia")
         item.button?.title = isWatching() ? "" : " off"
     }
 
     func menuNeedsUpdate(_ menu: NSMenu) {
         menu.removeAllItems()
-        add(menu, "Open GameON…", #selector(openLauncher))
+        add(menu, "Open Pluvia…", #selector(openLauncher))
         menu.addItem(.separator())
         let watching = isWatching()
         let dry = UserDefaults.standard.bool(forKey: "dryRun")
@@ -472,7 +472,7 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate {
         let l = add(menu, "Start at login", #selector(toggleLogin))
         l.state = FileManager.default.fileExists(atPath: agentPath) ? .on : .off
         menu.addItem(.separator())
-        add(menu, "Quit GameON (stops watching)", #selector(quit))
+        add(menu, "Quit Pluvia (stops watching)", #selector(quit))
     }
 
     @discardableResult
